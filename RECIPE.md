@@ -1,113 +1,131 @@
 # RECIPE — Consulente d'Immagine
 
-> **Source of truth.** Questa ricetta è l'unico luogo dove vivono le regole del comportamento della webapp. La webapp la carica a runtime, il codice NON duplica contenuto di questo file. Se la webapp si comporta diversamente da RECIPE.md → il bug è nel codice, non nella ricetta.
-
----
+> **Source of truth.** Letta a runtime dalla webapp.
 
 ## Obiettivo
 
-Aiutare una donna a ricevere **2-3 proposte di look complete** (capelli, trucco, rossetto, orecchini) da portare alla parrucchiera, partendo da:
-- una sua foto del viso
-- un'intervista rapida e calda
-- un'analisi automatica del volto
+Aiutare una donna a ricevere **2-3 proposte di look complete** (capelli, trucco, rossetto, orecchini, **occhiali**, **palette abiti**) da portare alla parrucchiera e mostrare al marito/compagna/amica — partendo da foto + intervista rapida.
 
-## Output finale per ogni look (max 3)
+## Output per ogni look (max 3)
 
-- **Titolo evocativo** (max 5 parole)
-- **Vibe** (1 frase che racchiude il mood)
-- **Capelli:** `taglio` + `colore` + `styling`
-- **Trucco:** `base` + `occhi` + `sopracciglia`
-- **Rossetto:** sfumatura specifica (es. "rosa mauve tenue")
-- **Orecchini:** tipo + materiale + dimensione (es. "cerchi piccoli oro giallo 1.5cm")
-- **"Perché ti sta"** (2 frasi: motivazione estetica legata ai tratti)
-- **Immagine generata** che preserva l'identità del volto
+- Titolo evocativo (max 5 parole)
+- Vibe (1 frase)
+- **Capelli:** taglio + colore + styling
+- **Trucco:** base + occhi + sopracciglia
+- **Rossetto:** sfumatura specifica (coerente con stagione cromatica)
+- **Orecchini:** tipo + materiale + dimensione (coerente con forma viso + stagione)
+- **Occhiali:** tipo + forma + materiale (se l'utente vuole portarli)
+- **Palette abiti:** 3 colori principali (swatches esadecimali) dalla stagione cromatica
+- **Metallo gioielli:** oro giallo / oro rosa / argento / oro bianco / misto
+- **"Perché ti sta":** 2 frasi (motivazione estetica + coerenza stagione)
+- **Immagine generata:** viso preservato (face restore canvas) + nuovo look
 
 ## Regole ferree
 
 ### R1 — Identità del volto: INVIOLABILE
 
-Nell'immagine generata questi elementi non possono cambiare:
-- Forma viso
-- Zigomi, naso, mento, bocca
-- Carnagione e undertone
-- Colore occhi
-- Forma occhi
-- Sopracciglia: solo refinement minimo, mai trasformazione radicale
+Elementi invariati nell'immagine generata:
+- Forma viso, mascella, zigomi
+- Naso (forma, dimensione, punta)
+- Occhi (colore, forma, distanza, palpebre)
+- Mento
+- Guance
+- Orecchie
+- Fronte
+- Collo
 
-### R2 — Dialogo veloce e caldo
+La webapp applica **face restoration post-processing**: MediaPipe rileva il volto nell'immagine originale e nel generato, Canvas ricompone il viso dell'originale sul generato con feathering ellittico. Se MediaPipe fallisce → fallback con warning.
 
-- Dopo le domande iniziali fisse, max **3 turni adattivi**
-- Una domanda alla volta
-- Mai domande decorative o tautologiche
-- Se l'utente scrive "basta", "proponi ora", "adesso" → proponi SUBITO i look
+### R2 — Intervista: 3 domande + nota libera (invariato da v0.3)
 
-### R3 — Intervista iniziale: 3 domande minime
+1. Occasione / momento di vita
+2. Come vuoi sentirti (2-3 aggettivi, chips suggeriti)
+3. Cosa NON vuoi (vincoli assoluti)
+4. Nota libera opzionale (500 char max)
++ **Opzione occhiali**: "Porti / vuoi portare occhiali in questo look?" (sì/no)
 
-1. **Occasione** — Per che momento di vita cerchi questo look?
-2. **Come vuoi sentirti** — 2-3 aggettivi tra: elegante, audace, naturale, magnetica, rilassata, raffinata, energica, dolce, autorevole, sofisticata, fresca, sensuale, intellettuale.
-3. **Cosa NON vuoi** — Vincoli assoluti (colori, tagli, stili da evitare).
+### R3 — Cromoterapia stagionale (Carole Jackson 4-season)
 
-### R4 — Prompt di image generation: vincolati
+Determinata da undertone + contrasto naturale + colore capelli naturali + colore occhi:
 
-Ogni `image_prompt` per Nano Banana deve essere **in inglese** e contenere almeno:
-- `"Preserve subject identity exactly: face shape, skin tone, eye color, eye shape, nose, mouth unchanged"`
-- `"Photorealistic portrait, natural lighting, professional fashion photography quality"`
-- Descrizione specifica e concreta di: hair (cut + color + styling), makeup (base + eyes + brows), lipstick shade, earrings
-- **NON può** introdurre elementi non emersi dal dialogo
-- **NON può** contradire i vincoli "NO" dell'utente
+```
+Spring / Primavera: warm + clear + bright
+  palette tipica: corallo, pesca, giallo caldo, turchese, verde erba
+  metallo: oro giallo, oro rosa
+  rossetti: corallo, peach, warm pink
 
-### R5 — Lingua
+Summer / Estate: cool + soft + light
+  palette tipica: rosa cipria, blu pastello, lavanda, grigio perla, bianco sporco
+  metallo: argento, oro bianco
+  rossetti: rosy pink, mauve soft, berry cool
 
-- UI, dialogo, output testuale: **ITALIANO**
-- Solo gli `image_prompt` sono in **inglese** (richiesto dai modelli di generazione)
+Autumn / Autunno: warm + muted + deep
+  palette tipica: terracotta, ocra, verde bosco, ruggine, bronzo, marrone
+  metallo: oro vecchio, bronzo, oro giallo opaco
+  rossetti: brick, terracotta, warm nude, brown-red
 
-### R6 — Budget tempo
+Winter / Inverno: cool + clear + contrast
+  palette tipica: bianco ottico, nero, rosso puro, blu cobalto, smeraldo, fucsia
+  metallo: argento, platino, oro bianco
+  rossetti: true red, fuchsia, plum, cool berry
+```
 
-- Dialogo: < 60 secondi totali (3 domande + max 3 adattive)
-- Generazione prompt + verifica avversariale: < 30 secondi
-- Generazione immagini: < 90 secondi totali (3 in parallelo)
-- **Budget totale dal click "proponi ora" alla prima immagine: < 60 secondi**
+Chromotherapy respects **vincoli NO** utente. Se utente dice "niente nero" ma stagione Winter → proponiamo alternative Winter senza nero.
 
-## Checklist verifica avversariale
+**Disclaimer obbligatorio nell'UI:** "La stagione cromatica è un orientamento dalla teoria Jackson 4-stagioni, non un dogma. Usa come bussola, non come gabbia."
 
-L'agente Opus (o fallback Haiku) riceve RECIPE.md + dialogo + image_prompts, e per ciascun prompt verifica che:
+### R4 — Abbinamento accessori per forma viso
 
-- [ ] **V1** Contiene clausola esplicita "Preserve subject identity"
-- [ ] **V2** Cita almeno 2 elementi emersi dal dialogo (non formulazioni generiche)
-- [ ] **V3** Rispetta tutti i "NO" espressi dall'utente
-- [ ] **V4** Coerente con gli aggettivi aspirazionali
-- [ ] **V5** Specifico su: hair, makeup, lipstick, earrings (tutti e 4)
-- [ ] **V6** Non introduce elementi non discussi
-- [ ] **V7** Inglese pulito, implementabile, < 150 parole
+```
+Ovale:      tutte le forme (versatile)
+Tondo:      angolari, rettangolari, geometrici (bilanciano morbidezza)
+Squadrato:  arrotondati, ovali, morbidi (ammorbidiscono mascella)
+Cuore:      bottom-heavy (occhiali con base più larga), orecchini pendenti ampi
+Lungo:      larghi orizzontali, orecchini rotondi bold (spezzano verticalità)
+Diamante:   cat-eye, orecchini morbidi, evita spigoli laterali
+```
 
-Se **anche uno solo** fallisce → auto-correct (max 2 iterazioni).
+### R5 — Prompt di image generation
+
+Ogni `english_prompt` deve contenere:
+- **Apertura:** "Photorealistic portrait. Preserve subject identity exactly: face shape, skin tone, eye color, eye shape, nose, mouth unchanged."
+- **Centro:** "Keep the person's face fully recognizable."
+- **Chiusura:** "Do not alter facial structure, complexion, or eye features in any way."
+- Descrizione: hair (cut+color+styling), makeup (base+eyes+brows), lipstick, earrings, glasses (se previsti), clothing color (coerente con palette), jewelry metal, lighting
+- Max 180 parole
+
+### R6 — Lingua
+
+UI + output testuale: **italiano**. Solo `english_prompt` in inglese.
+
+### R7 — Budget tempo
+
+- Upload → analisi → interview: ~30 sec
+- Prompt gen + adversarial + correct: < 30 sec
+- Image gen Nano Banana: ~45 sec (3 in parallelo)
+- Face restore in-browser: < 5 sec totali per 3 immagini
+- **Totale end-to-end atteso:** < 2 min
+
+## Checklist adversarial V1-V8 (v0.4)
+
+- **V1** preserve_identity: clausola esplicita di preservazione volto (inizio + centro + chiusura)
+- **V2** cites_dialogue: almeno 2 elementi concreti dal dialogo utente
+- **V3** respects_no: rispetta tutti i "NO"
+- **V4** coherent_adjectives: coerente con aggettivi aspirazionali
+- **V5** covers_all: hair + makeup + lipstick + earrings + glasses (se previsti) + clothing_palette
+- **V6** no_invented: non introduce elementi non discussi
+- **V7** clean_english: inglese pulito, < 180 parole
+- **V8 NEW** chromo_consistency: palette coerente con stagione cromatica, metallo coerente con stagione, rossetto dalla gamma della stagione
 
 ## Log errori
 
-Ogni errore in qualunque stage viene salvato in `localStorage` con schema:
-
-```json
-{
-  "ts": "ISO-8601",
-  "stage": "vision|interview|prompts|adversarial|correction|images",
-  "severity": "info|warn|error",
-  "message": "stringa leggibile",
-  "context": { "...": "..." },
-  "recovered": true
-}
-```
-
-Il log è scaricabile come JSON dall'UI (bottone "Scarica log" sempre visibile nella toolbar risultati). Letto dallo sviluppatore per iterare sulla versione successiva.
-
-## Costi (tracker visibile)
-
-La webapp mostra in footer i costi stimati per sessione. Default: modalità **FAST** (Haiku + Gemini Flash), costo stimato < €0.05/sessione. Modalità **QUALITY** (Opus + Gemini Pro) se l'utente la attiva: < €0.25/sessione.
+Ogni errore in qualunque stage salvato in `localStorage` come v0.3. Download sempre disponibile.
 
 ## Non fare
 
-- ❌ Chiedere informazioni personali non necessarie all'obiettivo (età specifica, peso, lavoro, relazioni)
-- ❌ Proporre look stereotipati per "donna di X anni" senza basarsi sul dialogo
-- ❌ Introdurre commenti sul fisico, peso, età, eleganza della foto
-- ❌ Fare domande moraliste ("sei sicura di volerlo cambiare?")
-- ❌ Proporre procedure chirurgiche, permanenti, o invasive
-- ❌ Generare immagini che cambiano il volto
+- ❌ Cambiare il volto (blocco architetturale con face restore)
+- ❌ Proporre palette incoerenti con stagione cromatica senza motivo
+- ❌ Stereotipare per età (non chiediamo età, non ne deduciamo)
+- ❌ Commentare peso, forma fisica, eleganza della foto
+- ❌ Procedure chirurgiche o invasive
+- ❌ Ignorare i "vincoli NO" per inseguire la teoria cromatica
