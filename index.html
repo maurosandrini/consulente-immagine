@@ -833,7 +833,7 @@ function renderSetup() {
       state.keys.anthropic = anthInput.value.trim();
       state.userName = nameInput.value.trim();
       await loadRecipe();
-      setState({ step: 'photo' });
+      setState({ step: 'photo', error: null });
       preflightAnthropic();
     }
   }, 'Inizia →'));
