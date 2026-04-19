@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Il tuo consulente d'immagine · v0.3</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  html, body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+  .display { font-family: 'Fraunces', Georgia, serif; font-feature-settings: "ss01"; }
+  .fade-in { animation: fadeIn .45s ease-out both; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .spinner { animation: spin .9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  textarea { field-sizing: content; }
+  details > summary { cursor: pointer; list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+  .chip { transition: all .15s; }
+  .chip:hover { transform: translateY(-1px); }
+  @media print {
+    .no-print { display: none !important; }
+    body { background: white !important; }
+    .look-card { page-break-inside: avoid; break-inside: avoid; }
+  }
+</style>
+</head>
+<body class="bg-stone-50 min-h-screen text-stone-900">
+<div id="app" class="max-w-3xl mx-auto px-4 py-8 md:py-12"></div>
+<div id="footer" class="max-w-3xl mx-auto px-4 pb-6 text-xs text-stone-400 no-print"></div>
+
+<script>
+/* =============================================================
+   SHAPE DOCS (vedi architettura-v0.3.md)
+   state = {
+     step, keys{gemini,anthropic}, userName, mode,
+     recipe, photo, faceAnalysis, preferences,
+     imagePrompts, verdicts, correctionIterations,
+     generatedImages, errorLog, isLoading, loadingMessage, error,
+     sessionCostCents, preflight{anthropic}
+   }
+   NAV: setup → photo → analyzing → interview → generating_prompts
+        → adversarial → correcting → generating → results
+   ============================================================= */
+
+/* =============================================================
+   COST TABLE (centesimi per call tipica, aggiornabile)
+   ============================================================= */
+const COST_TABLE = {
+  'gemini-2.5-flash': 0.1,
+  'gemini-2.5-pro': 0.5,
+  'gemini-2.5-flash-image': 3,
+  'gemini-2.5-flash-image-preview': 3,
+  'claude-haiku-4-5-20251001': 0.3,
+  'claude-opus-4-7': 2.5
+};
+
+/* =============================================================
+   FALLBACK RECIPE
+   ============================================================= */
+const FALLBACK_RECIPE = `# RECIPE fallback
+Output: 2-3 look completi (capelli, trucco, rossetto, orecchini). Preserva SEMPRE l'identità del volto (forma, carnagione, occhi, tratti). Intervista: 3 domande (occasione, aggettivi, vincoli NO) + nota libera opzionale. Ogni image_prompt in inglese con TRIPLA clausola di preservazione. Checklist avversariale V1-V7.`;
+
+/* =============================================================
+   MIGRATION
+   ============================================================= */
+(function migrate() {
+  // v0.1 → v0.3
+  if (!localStorage.getItem('ci3_gemini_key') && localStorage.getItem('ci_gemini_key'))
+    localStorage.setItem('ci3_gemini_key', localStorage.getItem('ci_gemini_key'));
+  // v0.2 → v0.3
+  if (!localStorage.getItem('ci3_gemini_key') && localStorage.getItem('ci2_gemini_key'))
+    localStorage.setItem('ci3_gemini_key', localStorage.getItem('ci2_gemini_key'));
+  if (!localStorage.getItem('ci3_anthropic_key') && localStorage.getItem('ci2_anthropic_key'))
+    localStorage.setItem('ci3_anthropic_key', localStorage.getItem('ci2_anthropic_key'));
+  if (!localStorage.getItem('ci3_user_name')) {
+    const v1 = localStorage.getItem('ci_user_name');
+    const v2 = localStorage.getItem('ci2_user_name');
+    if (v2 || v1) localStorage.setItem('ci3_user_name', v2 || v1);
+  }
+})();
+
+/* =============================================================
+   STATE
+   ============================================================= */
+const state = {
+  step: 'setup',
+  keys: {
+    gemini: localStorage.getItem('ci3_gemini_key') || '',
+    anthropic: localStorage.getItem('ci3_anthropic_key') || ''
+  },
+  userName: localStorage.getItem('ci3_user_name') || '',
+  mode: localStorage.getItem('ci3_mode') || 'fast',
+  recipe: null,
+  photo: { base64: null, dataUrl: null, mime: 'image/jpeg' },
+  faceAnalysis: null,
+  preferences: { occasione: '', aggettivi: '', vincoli_no: '', nota_libera: '' },
+  imagePrompts: null,
+  verdicts: null,
+  intro: '',
+  correctionIterations: {},
+  MAX_CORRECTION_ITER: 2,
+  generatedImages: {},
+  errorLog: JSON.parse(localStorage.getItem('ci3_error_log') || '[]'),
+  isLoading: false,
+  loadingMessage: '',
+  error: null,
+  sessionCostCents: 0,
+  preflight: { anthropic: 'unknown' }, // unknown | checking | ok | fail
+  editPromptIndex: null
+};
+
+const setState = (patch) => { Object.assign(state, patch); render(); };
+
+/* =============================================================
+   UTIL
+   ============================================================= */
+const el = (tag, attrs = {}, children = []) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') node.className = v;
+    else if (k === 'html') node.innerHTML = v;
+    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (k === 'text') node.textContent = v;
+    else node.setAttribute(k, v);
+  }
+  for (const c of [].concat(children)) if (c) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  return node;
+};
+
+const compressImage = (file, maxSide = 1280, quality = 0.88) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      c.getContext('2d').drawImage(img, 0, 0, w, h);
+      const dataUrl = c.toDataURL('image/jpeg', quality);
+      resolve({ dataUrl, base64: dataUrl.split(',')[1], mime: 'image/jpeg' });
+    };
+    img.onerror = reject;
+    img.src = reader.result;
+  };
+  reader.onerror = reject;
+  reader.readAsDataURL(file);
+});
+
+const extractJson = (text) => {
+  if (!text) return null;
+  const stripped = text.replace(/```(?:json)?\s*|\s*```/g, '').trim();
+  try { return JSON.parse(stripped); } catch {}
+  const match = stripped.match(/\{[\s\S]*\}/);
+  if (match) { try { return JSON.parse(match[0]); } catch {} }
+  return null;
+};
+
+function logError(stage, severity, message, context = {}, recovered = false) {
+  const entry = { ts: new Date().toISOString(), stage, severity, message, context, recovered };
+  state.errorLog.push(entry);
+  try { localStorage.setItem('ci3_error_log', JSON.stringify(state.errorLog.slice(-200))); } catch {}
+  console[severity === 'error' ? 'error' : 'log']('[ci3]', entry);
+}
+
+function trackCost(model) {
+  state.sessionCostCents += COST_TABLE[model] ?? 0.3;
+  renderFooter();
+}
+
+function clearErrorLog() {
+  if (!confirm('Svuotare il log errori?')) return;
+  state.errorLog = [];
+  localStorage.setItem('ci3_error_log', '[]');
+  renderFooter();
+  render();
+}
+
+/* =============================================================
+   API — Gemini
+   ============================================================= */
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+async function geminiCall(model, parts, opts = {}) {
+  const body = {
+    contents: [{ role: 'user', parts }],
+    generationConfig: {
+      temperature: opts.temperature ?? 0.6,
+      maxOutputTokens: opts.maxTokens ?? 3000,
+      ...(opts.json ? { responseMimeType: 'application/json' } : {}),
+      ...(opts.schema ? { responseSchema: opts.schema } : {}),
+      ...(opts.modalities ? { responseModalities: opts.modalities } : {})
+    }
+  };
+  const res = await fetch(`${GEMINI_BASE}/${model}:generateContent?key=${state.keys.gemini}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(`${model} ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  trackCost(model);
+  const data = await res.json();
+  return data?.candidates?.[0]?.content?.parts || [];
+}
+
+async function geminiText(model, prompt, opts = {}) {
+  const parts = await geminiCall(model, [{ text: prompt }], opts);
+  return parts.map(p => p.text).filter(Boolean).join('\n');
+}
+
+async function geminiVision(prompt, base64, mime, opts = {}) {
+  const parts = await geminiCall('gemini-2.5-flash', [{ text: prompt }, { inlineData: { mimeType: mime, data: base64 } }], opts);
+  return parts.map(p => p.text).filter(Boolean).join('\n');
+}
+
+async function nanoBanana(promptText, base64, mime = 'image/jpeg') {
+  const candidates = ['gemini-2.5-flash-image', 'gemini-2.5-flash-image-preview'];
+  let lastErr = null;
+  for (const model of candidates) {
+    try {
+      const parts = await geminiCall(model, [
+        { text: promptText },
+        { inlineData: { mimeType: mime, data: base64 } }
+      ], { modalities: ['TEXT', 'IMAGE'], maxTokens: 8000, temperature: 0.4 });
+      for (const p of parts) {
+        const inline = p.inlineData || p.inline_data;
+        if (inline?.data) {
+          const mt = inline.mimeType || inline.mime_type || 'image/png';
+          return `data:${mt};base64,${inline.data}`;
+        }
+      }
+      lastErr = new Error(`${model}: nessuna immagine nella risposta`);
+    } catch (e) { lastErr = e; logError('images', 'warn', `${model} failed`, { error: e.message }, true); }
+  }
+  throw lastErr || new Error('Nano Banana errore sconosciuto');
+}
+
+/* =============================================================
+   API — Anthropic (Claude Haiku 4.5 / Opus 4.7)
+   ============================================================= */
+async function anthropicCall(system, userMessage, opts = {}) {
+  if (!state.keys.anthropic) throw new Error('NO_ANTHROPIC_KEY');
+  const model = opts.model || (state.mode === 'quality' ? 'claude-opus-4-7' : 'claude-haiku-4-5-20251001');
+  const body = {
+    model,
+    max_tokens: opts.maxTokens || 3000,
+    system,
+    messages: [{ role: 'user', content: userMessage }]
+  };
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': state.keys.anthropic,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(`Anthropic ${model} ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  trackCost(model);
+  const data = await res.json();
+  return (data?.content || []).filter(p => p.type === 'text').map(p => p.text).join('\n');
+}
+
+/**
+ * Entry point unificato: prova Claude, fallback Gemini Pro.
+ * @param {string} system - system prompt
+ * @param {string} user - user message
+ * @param {object} opts - { maxTokens, stage }
+ */
+async function smartReason(system, user, opts = {}) {
+  if (state.keys.anthropic && state.preflight.anthropic !== 'fail') {
+    try {
+      return await anthropicCall(system, user, opts);
+    } catch (e) {
+      logError(opts.stage || 'smart', 'warn', `Claude fallito, fallback Gemini Pro`, { error: e.message }, true);
+      state.preflight.anthropic = 'fail';
+    }
+  }
+  const combined = `${system}\n\n---\n\n${user}`;
+  return await geminiText('gemini-2.5-pro', combined, { json: true, maxTokens: opts.maxTokens || 3000 });
+}
+
+/* =============================================================
+   PRE-FLIGHT CHECK (async, non blocking)
+   ============================================================= */
+async function preflightAnthropic() {
+  if (!state.keys.anthropic) { state.preflight.anthropic = 'unknown'; return; }
+  state.preflight.anthropic = 'checking';
+  renderFooter();
+  try {
+    await anthropicCall('Rispondi con "ok".', 'test', { maxTokens: 10, model: 'claude-haiku-4-5-20251001' });
+    state.preflight.anthropic = 'ok';
+    logError('preflight', 'info', 'Anthropic CORS ok', {});
+  } catch (e) {
+    state.preflight.anthropic = 'fail';
+    logError('preflight', 'warn', `Anthropic non raggiungibile: ${e.message}. Uso Gemini Pro come fallback.`, {}, true);
+  }
+  renderFooter();
+}
+
+/* =============================================================
+   STEP 0 — RECIPE
+   ============================================================= */
+async function loadRecipe() {
+  try {
+    const res = await fetch('./RECIPE.md');
+    if (res.ok) {
+      state.recipe = await res.text();
+      logError('recipe', 'info', 'RECIPE.md caricata', { size: state.recipe.length });
+      return;
+    }
+  } catch {}
+  state.recipe = FALLBACK_RECIPE;
+  logError('recipe', 'warn', 'fetch RECIPE.md fallito, uso fallback', {}, true);
+}
+
+/* =============================================================
+   STEP 1 — VISION
+   ============================================================= */
+const VISION_PROMPT = (recipe) => `Sei un consulente d'immagine professionale per consulenza beauty personale. Analizza la foto con occhio tecnico, solo osservazioni fattuali.
+
+${recipe}
+
+Rispondi SOLO con JSON:
+{
+  "forma_viso": "ovale|tondo|squadrato|cuore|lungo|diamante",
+  "lineamenti": "descrizione sintetica zigomi, mento, fronte",
+  "carnagione": "chiara|medio-chiara|media|olivastra|scura + undertone fredda|calda|neutra",
+  "occhi": { "colore": "...", "forma": "..." },
+  "sopracciglia": "colore, spessore, forma",
+  "capelli_attuali": { "lunghezza": "...", "texture": "lisci|mossi|ricci|afro", "colore": "...", "volume": "..." },
+  "trucco_visibile": "nessuno|naturale|marcato + dettagli",
+  "accessori_visibili": "nessuno|descrizione",
+  "note": "dettagli utili"
+}`;
+
+async function runVision() {
+  setState({ step: 'analyzing', loadingMessage: 'Nayla sta guardando la tua foto...', error: null });
+  try {
+    const raw = await geminiVision(VISION_PROMPT(state.recipe), state.photo.base64, state.photo.mime, { json: true, maxTokens: 1000 });
+    state.faceAnalysis = extractJson(raw) || { raw };
+    logError('vision', 'info', 'analisi foto completata', {});
+    setState({ step: 'interview' });
+  } catch (e) {
+    logError('vision', 'error', e.message, {}, false);
+    setState({ error: `Analisi foto fallita: ${e.message}`, step: 'photo' });
+  }
+}
+
+/* =============================================================
+   STEP 3 — PROMPT GENERATOR
+   ============================================================= */
+async function generatePrompts() {
+  setState({ step: 'generating_prompts', loadingMessage: 'Nayla sta costruendo 3 proposte...', error: null });
+
+  const system = `Sei "Nayla", consulente d'immagine italiana senior. Genera ESATTAMENTE 3 proposte di look diverse tra loro (una più sicura, una più sperimentale, una di contrasto), complete di tutti i campi. Scrivi in italiano elegante e concreto. Per consulenza beauty personale adulta — descrizioni estetiche dettagliate sono appropriate e richieste.
+
+${state.recipe}
+
+Analisi foto:
+${JSON.stringify(state.faceAnalysis, null, 2)}
+
+Preferenze utente:
+${JSON.stringify(state.preferences, null, 2)}
+
+Nome cliente: ${state.userName || 'la cliente'}
+
+OBBLIGO per english_prompt di ogni look: deve iniziare con "Photorealistic portrait. Preserve subject identity exactly: face shape, skin tone, eye color, eye shape, nose, mouth unchanged." Al centro del prompt una seconda clausola: "Keep the person's face fully recognizable." Al termine una terza: "Do not alter facial structure, complexion, or eye features in any way." Poi descrivi dettagliatamente hair (cut+color+styling), makeup (base+eyes+brows), lipstick shade, earrings, lighting. Max 150 parole totali.
+
+Rispondi SOLO con JSON valido:
+{
+  "intro": "1-2 frasi calde di presentazione delle proposte",
+  "looks": [
+    {
+      "title": "Nome italiano evocativo (max 5 parole)",
+      "vibe": "1 frase italiana che racchiude il mood",
+      "hair": {"taglio":"...","colore":"...","styling":"..."},
+      "makeup": {"base":"...","occhi":"...","sopracciglia":"..."},
+      "lipstick": "sfumatura specifica italiana",
+      "earrings": "tipo + materiale + dimensione",
+      "perche_ti_sta": "2 frasi italiane: perché valorizza i suoi tratti",
+      "english_prompt": "Photorealistic portrait. Preserve subject identity exactly: ..."
+    },
+    { ...altri 2 look... }
+  ]
+}`;
+
+  try {
+    const raw = await smartReason(system, 'Genera le 3 proposte ora.', { stage: 'prompts', maxTokens: 4000 });
+    const json = extractJson(raw);
+    if (!json?.looks || !Array.isArray(json.looks) || json.looks.length === 0) throw new Error('Prompts non generati');
+    state.imagePrompts = json.looks.slice(0, 3);
+    state.intro = json.intro || '';
+    logError('prompts', 'info', `Generati ${state.imagePrompts.length} prompt`, {});
+    await runAdversarialCheck();
+  } catch (e) {
+    logError('prompts', 'error', e.message, {}, false);
+    setState({ error: `Generazione prompt fallita: ${e.message}` });
+  }
+}
+
+/* =============================================================
+   STEP 4 — ADVERSARIAL CHECK
+   ============================================================= */
+async function runAdversarialCheck() {
+  setState({ step: 'adversarial', loadingMessage: 'Nayla sta verificando le proposte...', error: null });
+
+  const system = `Sei un agente avversariale rigoroso. Il tuo compito: verificare se ogni image_prompt rispetta 7 regole ferree derivate da RECIPE. Cita EVIDENZA TESTUALE (stringa dal prompt) per ogni check. Se non trovi evidenza chiara → il check fallisce. Regola: evidence deve essere >= 10 caratteri.
+
+${state.recipe}
+
+Preferenze utente:
+${JSON.stringify(state.preferences)}
+
+PROMPT DA VERIFICARE:
+${JSON.stringify(state.imagePrompts.map((p, i) => ({ index: i, title: p.title, english_prompt: p.english_prompt, hair: p.hair, makeup: p.makeup, lipstick: p.lipstick, earrings: p.earrings })), null, 2)}
+
+CHECKLIST (per ciascun prompt):
+- V1 preserve_identity: ha almeno 1 clausola esplicita di preservazione del volto?
+- V2 cites_dialogue: cita almeno 2 elementi concreti dalle preferenze utente (aggettivi, occasione, vincoli)?
+- V3 respects_no: rispetta tutti i "NO" dichiarati dall'utente?
+- V4 coherent_adjectives: coerente con gli aggettivi aspirazionali?
+- V5 covers_all_4: specifica hair + makeup + lipstick + earrings (tutti e 4)?
+- V6 no_invented: NON introduce elementi non discussi nelle preferenze o vision?
+- V7 clean_english: inglese pulito, < 150 parole, implementabile?
+
+Rispondi SOLO con JSON:
+{
+  "verdicts": [
+    {
+      "prompt_index": 0,
+      "verdict": "pass" | "fail",
+      "checks": {
+        "V1_preserve_identity": {"pass": true, "evidence": "citazione testuale >=10 char"},
+        "V2_cites_dialogue": {"pass": true, "evidence": "..."},
+        "V3_respects_no": {"pass": true, "evidence": "..."},
+        "V4_coherent_adjectives": {"pass": true, "evidence": "..."},
+        "V5_covers_all_4": {"pass": true, "evidence": "..."},
+        "V6_no_invented": {"pass": true, "evidence": "..."},
+        "V7_clean_english": {"pass": true, "evidence": "..."}
+      },
+      "fix_hint": "null se pass; se fail, istruzione SPECIFICA per correggere (solo cosa cambiare)"
+    }
+  ]
+}`;
+
+  try {
+    const raw = await smartReason(system, 'Esegui la verifica ora.', { stage: 'adversarial', maxTokens: 4000 });
+    const json = extractJson(raw);
+    if (!json?.verdicts) throw new Error('Adversarial: output non interpretabile');
+    // Post-processing: evidence <10 char → fail
+    for (const v of json.verdicts) {
+      if (v.checks) {
+        for (const k of Object.keys(v.checks)) {
+          const ev = v.checks[k].evidence || '';
+          if (v.checks[k].pass && ev.length < 10) {
+            v.checks[k].pass = false;
+            v.verdict = 'fail';
+            v.fix_hint = v.fix_hint || `Check ${k} failed: evidence insufficiente ("${ev}").`;
+          }
+        }
+      }
+    }
+    state.verdicts = json.verdicts;
+    const failing = json.verdicts.filter(v => v.verdict === 'fail');
+    logError('adversarial', 'info', `${json.verdicts.length} verdetti, ${failing.length} fail`, {});
+    if (failing.length === 0) await generateAllImages();
+    else await runCorrector(failing);
+  } catch (e) {
+    logError('adversarial', 'warn', `Adversarial fallito, procedo comunque: ${e.message}`, {}, true);
+    await generateAllImages();
+  }
+}
+
+/* =============================================================
+   STEP 5 — CORRECTOR
+   ============================================================= */
+async function runCorrector(failingVerdicts) {
+  setState({ step: 'correcting', loadingMessage: `Nayla sta rifinendo ${failingVerdicts.length} proposte...`, error: null });
+
+  const toFix = failingVerdicts.filter(v => (state.correctionIterations[v.prompt_index] || 0) < state.MAX_CORRECTION_ITER);
+  if (toFix.length === 0) {
+    logError('correction', 'warn', 'Max iterazioni raggiunte, procedo con originali', { indices: failingVerdicts.map(v => v.prompt_index) }, true);
+    await generateAllImages();
+    return;
+  }
+
+  const system = `Sei un agente di correzione preciso. Ricevi prompt flaggati con fix_hint SPECIFICO. Applica MINIMAMENTE il fix, senza stravolgere.
+
+${state.recipe}
+
+PROMPT DA CORREGGERE:
+${JSON.stringify(toFix.map(v => ({ index: v.prompt_index, original: state.imagePrompts[v.prompt_index], fix_hint: v.fix_hint })), null, 2)}
+
+Rispondi SOLO con JSON:
+{
+  "corrected": [
+    {
+      "index": 0,
+      "english_prompt": "versione corretta",
+      "title": "...", "vibe": "...",
+      "hair": {...}, "makeup": {...}, "lipstick": "...", "earrings": "...",
+      "perche_ti_sta": "..."
+    }
+  ]
+}`;
+
+  try {
+    const raw = await smartReason(system, 'Correggi ora.', { stage: 'correction', maxTokens: 3000 });
+    const json = extractJson(raw);
+    if (!json?.corrected) throw new Error('Corrector: output non interpretabile');
+    for (const c of json.corrected) {
+      if (typeof c.index !== 'number') continue;
+      state.correctionIterations[c.index] = (state.correctionIterations[c.index] || 0) + 1;
+      state.imagePrompts[c.index] = { ...state.imagePrompts[c.index], ...c };
+    }
+    logError('correction', 'info', `Corretti ${json.corrected.length}`, {});
+    await runAdversarialCheck();
+  } catch (e) {
+    logError('correction', 'warn', `Corrector fallito: ${e.message}, procedo con originali`, {}, true);
+    await generateAllImages();
+  }
+}
+
+/* =============================================================
+   STEP 6 — IMAGE GEN (parallel)
+   ============================================================= */
+async function generateAllImages() {
+  setState({ step: 'generating', loadingMessage: 'Nayla sta disegnando i look...', error: null });
+  state.generatedImages = {};
+  render();
+  await Promise.all(state.imagePrompts.map((look, i) => generateOne(i, look)));
+  setState({ step: 'results' });
+}
+
+async function generateOne(i, look, retry = 0) {
+  try {
+    const img = await nanoBanana(look.english_prompt, state.photo.base64, state.photo.mime);
+    state.generatedImages[i] = img;
+    logError('images', 'info', `Immagine ${i} generata`, {});
+    render();
+  } catch (e) {
+    if (retry < 1) return generateOne(i, look, retry + 1);
+    logError('images', 'error', `Immagine ${i} fallita`, { error: e.message }, false);
+    state.generatedImages[i] = { error: e.message };
+    render();
+  }
+}
+
+/* =============================================================
+   RESET / NAV
+   ============================================================= */
+function resetSession() {
+  state.photo = { base64: null, dataUrl: null, mime: 'image/jpeg' };
+  state.faceAnalysis = null;
+  state.preferences = { occasione: '', aggettivi: '', vincoli_no: '', nota_libera: '' };
+  state.imagePrompts = null; state.verdicts = null;
+  state.correctionIterations = {}; state.generatedImages = {};
+  state.error = null; state.sessionCostCents = 0;
+  state.editPromptIndex = null;
+  setState({ step: 'photo' });
+}
+
+function clearKeys() {
+  if (!confirm('Cancellare le API key salvate?')) return;
+  localStorage.removeItem('ci3_gemini_key');
+  localStorage.removeItem('ci3_anthropic_key');
+  state.keys = { gemini: '', anthropic: '' };
+  state.preflight = { anthropic: 'unknown' };
+  setState({ step: 'setup' });
+}
+
+function downloadLog() {
+  const blob = new Blob([JSON.stringify(state.errorLog, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `consulente-immagine-log-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* =============================================================
+   RENDER
+   ============================================================= */
+function render() {
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  app.appendChild(renderHeader());
+  if (state.error) app.appendChild(renderError());
+  if (state.preflight.anthropic === 'fail' && state.step !== 'setup') app.appendChild(renderPreflightBanner());
+  const step = ({
+    setup: renderSetup, photo: renderPhoto, analyzing: renderLoading,
+    interview: renderInterview,
+    generating_prompts: renderLoading, adversarial: renderLoading,
+    correcting: renderLoading, generating: renderGenerating,
+    results: renderResults
+  })[state.step];
+  if (step) app.appendChild(step());
+  renderFooter();
+}
+
+function renderFooter() {
+  const footer = document.getElementById('footer');
+  if (!footer) return;
+  footer.innerHTML = '';
+  const statusAnth = state.preflight.anthropic;
+  const modeLabel = statusAnth === 'fail' ? 'fallback Gemini' : state.mode.toUpperCase();
+  const left = el('span', {}, `v0.3 · ${modeLabel} · costo sessione ~€${(state.sessionCostCents/100).toFixed(3)}`);
+  const right = el('span', { class: 'float-right' });
+  if (state.errorLog.length > 0) {
+    right.appendChild(el('button', {
+      class: 'underline hover:text-stone-700 mr-3',
+      onclick: downloadLog
+    }, `📥 log (${state.errorLog.length})`));
+  }
+  if (state.step !== 'setup') {
+    right.appendChild(el('button', {
+      class: 'underline hover:text-stone-700',
+      onclick: () => setState({ step: 'setup' })
+    }, '⚙ impostazioni'));
+  }
+  footer.append(left, right);
+}
+
+function renderHeader() {
+  return el('header', { class: 'mb-8 text-center fade-in no-print' }, [
+    el('p', { class: 'text-[10px] tracking-[0.35em] text-stone-500 uppercase mb-2', text: 'v0.3 · privato · self-verifying' }),
+    el('h1', { class: 'display text-4xl md:text-5xl font-light text-stone-900 leading-tight', text: "Il tuo consulente d'immagine" }),
+    el('p', { class: 'text-stone-600 mt-3 max-w-lg mx-auto', text: 'Una foto, tre domande, tre proposte firmate Nayla.' })
+  ]);
+}
+
+function renderError() {
+  return el('div', { class: 'mb-6 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800 fade-in no-print' }, [
+    el('div', { class: 'font-medium mb-1', text: 'Qualcosa è andato storto' }),
+    el('div', { text: state.error }),
+    el('button', { class: 'mt-2 text-xs underline', onclick: () => setState({ error: null }) }, 'Chiudi')
+  ]);
+}
+
+function renderPreflightBanner() {
+  return el('div', { class: 'mb-6 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 fade-in no-print' },
+    'Claude non raggiungibile da questo contesto (CORS). Uso Gemini Pro come fallback per adversarial + correzione.'
+  );
+}
+
+function renderSetup() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-6 md:p-8 fade-in' });
+  wrap.appendChild(el('h2', { class: 'display text-2xl mb-4', text: 'Setup (una volta sola)' }));
+
+  wrap.appendChild(el('label', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-1 block', text: 'Nome' }));
+  const nameInput = el('input', {
+    type: 'text', placeholder: 'Nome',
+    class: 'w-full px-4 py-3 rounded-lg border border-stone-300 focus:outline-none focus:border-stone-900 mb-4',
+    value: state.userName
+  });
+  wrap.appendChild(nameInput);
+
+  wrap.appendChild(el('label', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-1 block', text: 'API key Google Gemini (richiesta)' }));
+  const geminiInput = el('input', {
+    type: 'password', placeholder: 'AIza...',
+    class: 'w-full px-4 py-3 rounded-lg border border-stone-300 focus:outline-none focus:border-stone-900 mb-1 font-mono text-sm',
+    value: state.keys.gemini
+  });
+  wrap.appendChild(geminiInput);
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-4', html: 'La ottieni gratis su <a class="underline text-stone-900" href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio</a>.' }));
+
+  wrap.appendChild(el('label', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-1 block', text: 'API key Anthropic (opzionale)' }));
+  const anthInput = el('input', {
+    type: 'password', placeholder: 'sk-ant-api03-...',
+    class: 'w-full px-4 py-3 rounded-lg border border-stone-300 focus:outline-none focus:border-stone-900 mb-1 font-mono text-sm',
+    value: state.keys.anthropic
+  });
+  wrap.appendChild(anthInput);
+  const anthStatus = state.preflight.anthropic;
+  const statusDot = anthStatus === 'ok' ? '🟢 verificata' : anthStatus === 'fail' ? '🟠 CORS bloccato, fallback Gemini' : anthStatus === 'checking' ? '⏳ controllo...' : '⚪ non verificata';
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-4', html: `Sblocca Claude Haiku/Opus per adversarial + correzione. Crei la chiave su <a class="underline text-stone-900" href="https://console.anthropic.com/settings/keys" target="_blank">Anthropic Console</a>. Senza: fallback automatico a Gemini Pro. <span class="ml-2 font-medium">${statusDot}</span>` }));
+
+  wrap.appendChild(el('label', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-2 block', text: 'Modalità' }));
+  const modeWrap = el('div', { class: 'flex gap-2 mb-2' });
+  ['fast', 'quality'].forEach(m => {
+    modeWrap.appendChild(el('button', {
+      class: `flex-1 py-2 px-3 rounded-lg text-sm border ${state.mode === m ? 'bg-stone-900 text-white border-stone-900' : 'bg-white text-stone-700 border-stone-300 hover:bg-stone-50'}`,
+      onclick: () => { state.mode = m; render(); }
+    }, m === 'fast' ? '⚡ FAST (Haiku, ~10¢/sessione)' : '✨ QUALITY (Opus, ~22¢/sessione)'));
+  });
+  wrap.appendChild(modeWrap);
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-6', text: state.mode === 'fast' ? 'Haiku 4.5 affidabile e veloce. Consigliato.' : 'Opus 4.7 per massimo rigore. Più lento ma più severo.' }));
+
+  // Advanced settings disclosure
+  const adv = el('details', { class: 'mt-6 border-t border-stone-100 pt-4' });
+  adv.appendChild(el('summary', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-2', text: '⚙ Impostazioni avanzate' }));
+  const advInner = el('div', { class: 'flex gap-2 mt-2' });
+  advInner.appendChild(el('button', {
+    class: 'text-xs underline text-stone-600',
+    onclick: clearKeys
+  }, 'Reset chiavi'));
+  advInner.appendChild(el('button', {
+    class: 'text-xs underline text-stone-600',
+    onclick: clearErrorLog
+  }, 'Svuota log errori'));
+  adv.appendChild(advInner);
+  wrap.appendChild(adv);
+
+  wrap.appendChild(el('button', {
+    class: 'mt-6 w-full py-3 rounded-lg bg-stone-900 text-white font-medium hover:bg-stone-800 transition',
+    onclick: async () => {
+      if (!geminiInput.value.trim()) { setState({ error: 'Serve almeno la chiave Gemini.' }); return; }
+      localStorage.setItem('ci3_gemini_key', geminiInput.value.trim());
+      localStorage.setItem('ci3_anthropic_key', anthInput.value.trim());
+      localStorage.setItem('ci3_user_name', nameInput.value.trim());
+      localStorage.setItem('ci3_mode', state.mode);
+      state.keys.gemini = geminiInput.value.trim();
+      state.keys.anthropic = anthInput.value.trim();
+      state.userName = nameInput.value.trim();
+      await loadRecipe();
+      setState({ step: 'photo' });
+      // Pre-flight async
+      preflightAnthropic();
+    }
+  }, 'Inizia →'));
+  return wrap;
+}
+
+function renderPhoto() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-6 md:p-8 fade-in' });
+  wrap.appendChild(el('h2', { class: 'display text-2xl mb-2', text: `Ciao${state.userName ? ' ' + state.userName : ''}, carica la foto.` }));
+  wrap.appendChild(el('p', { class: 'text-sm text-stone-600 mb-6', text: 'Primo piano o mezzo busto, luce naturale, senza occhiali da sole. Resta tutto sul tuo browser.' }));
+
+  const input = el('input', { type: 'file', accept: 'image/*', class: 'hidden' });
+  input.addEventListener('change', async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    try { state.photo = await compressImage(file); setState({}); }
+    catch { setState({ error: 'Impossibile leggere la foto.' }); }
+  });
+
+  const dropzone = el('label', { class: 'block border-2 border-dashed border-stone-300 rounded-xl p-8 text-center cursor-pointer hover:border-stone-500 transition' });
+  if (state.photo.dataUrl) {
+    dropzone.appendChild(el('img', { src: state.photo.dataUrl, class: 'mx-auto max-h-72 rounded-lg mb-3' }));
+    dropzone.appendChild(el('p', { class: 'text-sm text-stone-600', text: 'Clicca per cambiare foto' }));
+  } else {
+    dropzone.appendChild(el('div', { class: 'text-stone-400 text-6xl mb-3 display', text: '+' }));
+    dropzone.appendChild(el('p', { class: 'text-sm text-stone-600', text: 'Clicca o trascina qui la foto' }));
+  }
+  dropzone.appendChild(input);
+  dropzone.addEventListener('dragover', e => e.preventDefault());
+  dropzone.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0]; if (!file) return;
+    try { state.photo = await compressImage(file); setState({}); }
+    catch { setState({ error: 'Impossibile leggere la foto.' }); }
+  });
+
+  const btn = el('button', {
+    class: `mt-6 w-full py-3 rounded-lg font-medium transition ${state.photo.base64 ? 'bg-stone-900 text-white hover:bg-stone-800' : 'bg-stone-200 text-stone-400 cursor-not-allowed'}`,
+    onclick: () => state.photo.base64 && runVision()
+  }, state.photo.base64 ? 'Analizza la foto →' : 'Prima carica una foto');
+  wrap.append(dropzone, btn);
+  return wrap;
+}
+
+function renderLoading() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-8 text-center fade-in' });
+  wrap.appendChild(el('div', { class: 'inline-block w-10 h-10 border-2 border-stone-300 border-t-stone-900 rounded-full spinner mb-4' }));
+  wrap.appendChild(el('p', { class: 'display text-xl text-stone-800', text: state.loadingMessage || 'Sto lavorando...' }));
+  return wrap;
+}
+
+const ADJ_CHIPS = [
+  'elegante', 'audace', 'naturale', 'magnetica', 'raffinata',
+  'rilassata', 'autorevole', 'dolce', 'sofisticata', 'fresca',
+  'ironica', 'intellettuale'
+];
+
+function renderInterview() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-6 md:p-8 fade-in' });
+  wrap.appendChild(el('h2', { class: 'display text-2xl mb-2', text: 'Tre cose e una libertà.' }));
+  wrap.appendChild(el('p', { class: 'text-sm text-stone-600 mb-6', text: 'Tre domande concrete, più una nota libera se vuoi dirmi qualcos\'altro.' }));
+
+  // Q1 Occasione
+  wrap.appendChild(el('label', { class: 'block text-sm font-medium text-stone-800 mb-1', text: '1. Per che occasione?' }));
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-2', text: 'Quotidiano, evento specifico, nuovo capitolo...' }));
+  const q1 = el('textarea', {
+    class: 'w-full px-3 py-2 rounded-lg border border-stone-300 text-sm focus:outline-none focus:border-stone-900 min-h-[60px] mb-5',
+    placeholder: 'Es. matrimonio di un\'amica a giugno', rows: 2
+  });
+  q1.value = state.preferences.occasione;
+  q1.addEventListener('input', e => state.preferences.occasione = e.target.value);
+  wrap.appendChild(q1);
+
+  // Q2 Aggettivi + chips
+  wrap.appendChild(el('label', { class: 'block text-sm font-medium text-stone-800 mb-1', text: '2. Come vuoi sentirti?' }));
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-2', text: '2-3 aggettivi. Clicca gli spunti qui sotto oppure scrivi i tuoi.' }));
+  const q2 = el('textarea', {
+    class: 'w-full px-3 py-2 rounded-lg border border-stone-300 text-sm focus:outline-none focus:border-stone-900 min-h-[60px] mb-2',
+    placeholder: 'Es. raffinata, fresca, un po\' audace', rows: 2
+  });
+  q2.value = state.preferences.aggettivi;
+  q2.addEventListener('input', e => state.preferences.aggettivi = e.target.value);
+  wrap.appendChild(q2);
+
+  const chipsWrap = el('div', { class: 'flex flex-wrap gap-2 mb-5' });
+  ADJ_CHIPS.forEach(adj => {
+    chipsWrap.appendChild(el('button', {
+      class: 'chip px-3 py-1 rounded-full border border-stone-300 text-xs text-stone-700 hover:border-stone-900 hover:bg-stone-900 hover:text-white',
+      onclick: () => {
+        const cur = q2.value.trim();
+        if (cur.toLowerCase().includes(adj.toLowerCase())) return;
+        q2.value = cur ? `${cur}, ${adj}` : adj;
+        state.preferences.aggettivi = q2.value;
+      }
+    }, adj));
+  });
+  wrap.appendChild(chipsWrap);
+
+  // Q3 Vincoli NO
+  wrap.appendChild(el('label', { class: 'block text-sm font-medium text-stone-800 mb-1', text: '3. Cosa NON vuoi?' }));
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-2', text: 'Vincoli assoluti: colori, tagli, stili da evitare.' }));
+  const q3 = el('textarea', {
+    class: 'w-full px-3 py-2 rounded-lg border border-stone-300 text-sm focus:outline-none focus:border-stone-900 min-h-[60px] mb-5',
+    placeholder: 'Es. niente biondo, niente frangia, niente rossetti scuri', rows: 2
+  });
+  q3.value = state.preferences.vincoli_no;
+  q3.addEventListener('input', e => state.preferences.vincoli_no = e.target.value);
+  wrap.appendChild(q3);
+
+  // Q4 Nota libera
+  wrap.appendChild(el('label', { class: 'block text-sm font-medium text-stone-800 mb-1', text: '4. Nota libera (opzionale)' }));
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-2', text: 'C\'è qualcos\'altro che vuoi dirmi? Il momento che stai vivendo, un dettaglio che le domande sopra non hanno colto, un\'icona che ti ispira.' }));
+  const q4 = el('textarea', {
+    class: 'w-full px-3 py-2 rounded-lg border border-stone-300 text-sm focus:outline-none focus:border-stone-900 min-h-[80px]',
+    placeholder: 'Es. sono in un momento di cambiamento, lavoro nuovo, vorrei sentirmi più decisa. Mi piace lo stile di Tilda Swinton.',
+    rows: 3, maxlength: '500'
+  });
+  q4.value = state.preferences.nota_libera;
+  const counter = el('p', { class: 'text-[10px] text-stone-400 mt-1 text-right', text: `${q4.value.length}/500` });
+  q4.addEventListener('input', e => {
+    state.preferences.nota_libera = e.target.value;
+    counter.textContent = `${e.target.value.length}/500`;
+  });
+  wrap.append(q4, counter);
+
+  wrap.appendChild(el('button', {
+    class: 'mt-6 w-full py-3 rounded-lg bg-stone-900 text-white font-medium hover:bg-stone-800 transition',
+    onclick: () => {
+      const filled = ['occasione', 'aggettivi', 'vincoli_no'].every(k => state.preferences[k].trim().length > 0);
+      if (!filled) { setState({ error: 'Rispondi alle prime 3 (la nota libera è opzionale).' }); return; }
+      generatePrompts();
+    }
+  }, 'Genera le 3 proposte →'));
+  return wrap;
+}
+
+function renderGenerating() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-8 fade-in' });
+  wrap.appendChild(el('div', { class: 'flex items-center gap-3 mb-4' }, [
+    el('div', { class: 'w-5 h-5 border-2 border-stone-300 border-t-stone-900 rounded-full spinner' }),
+    el('h2', { class: 'display text-xl', text: 'Nayla sta disegnando i tuoi look...' })
+  ]));
+  const list = el('div', { class: 'space-y-2' });
+  state.imagePrompts.forEach((look, i) => {
+    const done = state.generatedImages[i];
+    const status = done ? (done.error ? '✕' : '✓') : '…';
+    const color = done ? (done.error ? 'text-rose-500' : 'text-emerald-600') : 'text-stone-400';
+    list.appendChild(el('div', { class: 'flex items-center gap-3 text-sm' }, [
+      el('span', { class: `${color} font-mono`, text: status }),
+      el('span', { text: look.title })
+    ]));
+  });
+  wrap.appendChild(list);
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mt-4', text: 'Generazione in parallelo, ~30-45 secondi.' }));
+  return wrap;
+}
+
+function renderResults() {
+  const container = el('div', { class: 'space-y-6 fade-in' });
+
+  const toolbar = el('div', { class: 'flex items-center justify-between no-print flex-wrap gap-2' }, [
+    el('h2', { class: 'display text-2xl', text: 'Ecco i tuoi look' }),
+    el('div', { class: 'flex gap-2 flex-wrap' }, [
+      el('button', {
+        class: 'px-3 py-2 text-sm rounded-lg border border-stone-300 hover:bg-stone-100',
+        onclick: () => { state.generatedImages = {}; generateAllImages(); }
+      }, '↻ Rigenera tutte'),
+      el('button', {
+        class: 'px-3 py-2 text-sm rounded-lg border border-stone-300 hover:bg-stone-100',
+        onclick: () => window.print()
+      }, '🖨 Stampa'),
+      el('button', {
+        class: 'px-3 py-2 text-sm rounded-lg border border-stone-300 hover:bg-stone-100',
+        onclick: resetSession
+      }, '↻ Nuovo look')
+    ])
+  ]);
+  container.appendChild(toolbar);
+
+  if (state.intro) container.appendChild(el('p', { class: 'text-stone-700 italic', text: '"' + state.intro + '" — Nayla' }));
+
+  state.imagePrompts.forEach((look, i) => {
+    const img = state.generatedImages[i];
+    const verdict = state.verdicts?.find(v => v.prompt_index === i);
+    const card = el('div', { class: 'look-card bg-white rounded-2xl shadow-sm border border-stone-200 overflow-hidden' });
+    const grid = el('div', { class: 'grid md:grid-cols-2' });
+
+    // Image column
+    const imgCol = el('div', { class: 'bg-stone-100 p-4 flex flex-col gap-3 items-center justify-center' });
+    imgCol.appendChild(el('p', { class: 'text-[10px] tracking-[0.2em] uppercase text-stone-500', text: 'Prima → Dopo' }));
+    const pair = el('div', { class: 'flex gap-3 w-full justify-center' });
+    pair.appendChild(el('img', { src: state.photo.dataUrl, class: 'w-1/2 max-w-[160px] rounded-lg object-cover' }));
+    if (typeof img === 'string') {
+      pair.appendChild(el('img', { src: img, class: 'w-1/2 max-w-[160px] rounded-lg object-cover' }));
+    } else if (img && img.error) {
+      const errBox = el('div', { class: 'w-1/2 max-w-[160px] aspect-square rounded-lg bg-rose-50 border border-rose-200 p-2 text-[10px] text-rose-700 flex flex-col justify-between' });
+      errBox.appendChild(el('div', { text: (img.error || '').slice(0, 120) }));
+      errBox.appendChild(el('button', {
+        class: 'mt-1 text-xs underline text-rose-800',
+        onclick: async () => { delete state.generatedImages[i]; render(); await generateOne(i, look); }
+      }, '↻ Riprova'));
+      pair.appendChild(errBox);
+    } else {
+      pair.appendChild(el('div', { class: 'w-1/2 max-w-[160px] aspect-square rounded-lg bg-stone-200 animate-pulse' }));
+    }
+    imgCol.appendChild(pair);
+    if (typeof img === 'string') {
+      imgCol.appendChild(el('a', {
+        href: img, download: `look-${i + 1}-${(look.title || '').replace(/\s+/g, '-').toLowerCase()}.png`,
+        class: 'text-xs underline text-stone-600 no-print'
+      }, '⬇ scarica immagine'));
+    }
+    // Regenerate single + Edit prompt buttons
+    const actionsSingle = el('div', { class: 'flex gap-2 mt-2 no-print' });
+    actionsSingle.appendChild(el('button', {
+      class: 'text-[10px] underline text-stone-600',
+      onclick: async () => { delete state.generatedImages[i]; render(); await generateOne(i, look); }
+    }, '↻ solo questa'));
+    actionsSingle.appendChild(el('button', {
+      class: 'text-[10px] underline text-stone-600',
+      onclick: () => { state.editPromptIndex = (state.editPromptIndex === i ? null : i); render(); }
+    }, '✏ modifica prompt'));
+    imgCol.appendChild(actionsSingle);
+    grid.appendChild(imgCol);
+
+    // Text column
+    const txt = el('div', { class: 'p-5 md:p-6 space-y-3' });
+    const verdictTag = verdict ? ' · ' + (verdict.verdict === 'pass' ? '✓ verificata' : '△ approssimativa') : '';
+    txt.appendChild(el('div', {}, [
+      el('p', { class: 'text-[10px] tracking-[0.2em] uppercase text-stone-400', text: `Proposta ${i + 1}${verdictTag}` }),
+      el('h3', { class: 'display text-2xl text-stone-900', text: look.title || '—' }),
+      el('p', { class: 'text-sm italic text-stone-600 mt-1', text: look.vibe || '' })
+    ]));
+
+    const field = (label, value) => {
+      const row = el('div', {});
+      row.appendChild(el('p', { class: 'text-[10px] uppercase tracking-wider text-stone-500', text: label }));
+      row.appendChild(el('p', { class: 'text-sm text-stone-800', text: value || '—' }));
+      return row;
+    };
+    const hair = look.hair || {}, makeup = look.makeup || {};
+    const g2 = el('div', { class: 'grid grid-cols-2 gap-3 pt-2 border-t border-stone-100' });
+    g2.append(
+      field('Taglio', hair.taglio), field('Colore capelli', hair.colore),
+      field('Styling', hair.styling), field('Base trucco', makeup.base),
+      field('Occhi', makeup.occhi), field('Sopracciglia', makeup.sopracciglia),
+      field('Rossetto', look.lipstick), field('Orecchini', look.earrings)
+    );
+    txt.appendChild(g2);
+
+    if (look.perche_ti_sta) {
+      txt.appendChild(el('div', { class: 'pt-2 border-t border-stone-100' }, [
+        el('p', { class: 'text-[10px] uppercase tracking-wider text-stone-500 mb-1', text: 'Perché ti sta — Nayla' }),
+        el('p', { class: 'text-sm text-stone-700 italic', text: look.perche_ti_sta })
+      ]));
+    }
+
+    // Edit prompt inline
+    if (state.editPromptIndex === i) {
+      const editBox = el('div', { class: 'pt-2 border-t border-stone-100 space-y-2 no-print' });
+      editBox.appendChild(el('p', { class: 'text-[10px] uppercase tracking-wider text-stone-500', text: 'Modifica prompt immagine (inglese)' }));
+      const ta = el('textarea', {
+        class: 'w-full px-3 py-2 rounded-lg border border-stone-300 text-xs font-mono focus:outline-none focus:border-stone-900 min-h-[120px]'
+      });
+      ta.value = look.english_prompt || '';
+      const saveBtn = el('button', {
+        class: 'px-3 py-1 text-xs rounded-lg bg-stone-900 text-white hover:bg-stone-800',
+        onclick: async () => {
+          state.imagePrompts[i].english_prompt = ta.value;
+          state.editPromptIndex = null;
+          delete state.generatedImages[i];
+          render();
+          await generateOne(i, state.imagePrompts[i]);
+        }
+      }, 'Salva e rigenera');
+      editBox.append(ta, saveBtn);
+      txt.appendChild(editBox);
+    }
+
+    // Technical details collapsed
+    if (verdict) {
+      const det = el('details', { class: 'no-print pt-2 border-t border-stone-100' });
+      det.appendChild(el('summary', { class: 'text-xs text-stone-500 underline', text: 'Dettagli tecnici (checklist avversariale)' }));
+      const checksDiv = el('div', { class: 'mt-2 space-y-1 text-xs text-stone-600' });
+      Object.entries(verdict.checks || {}).forEach(([k, v]) => {
+        checksDiv.appendChild(el('div', { text: `${v.pass ? '✓' : '✕'} ${k}${v.evidence ? ' — ' + v.evidence.slice(0, 80) : ''}` }));
+      });
+      if (verdict.fix_hint) checksDiv.appendChild(el('div', { class: 'text-amber-700 mt-1', text: 'fix: ' + verdict.fix_hint }));
+      det.appendChild(checksDiv);
+      txt.appendChild(det);
+    }
+
+    grid.appendChild(txt);
+    card.appendChild(grid);
+    container.appendChild(card);
+  });
+
+  const errorsInSession = state.errorLog.filter(e => e.severity === 'error').length;
+  if (errorsInSession > 0) {
+    container.appendChild(el('div', { class: 'rounded-lg bg-amber-50 border border-amber-200 p-3 text-xs text-amber-800 no-print' }, [
+      el('span', { text: `Nota: ${errorsInSession} errore/i in questa sessione. ` }),
+      el('button', { class: 'underline font-medium', onclick: downloadLog }, 'Scarica log')
+    ]));
+  }
+
+  container.appendChild(el('p', { class: 'text-xs text-stone-400 text-center pt-4 no-print', text: `v0.3 · modalità ${state.mode} · ${state.preflight.anthropic === 'fail' ? 'Gemini Pro (fallback)' : 'Claude ' + (state.mode === 'quality' ? 'Opus 4.7' : 'Haiku 4.5')} + Gemini vision + Nano Banana` }));
+  return container;
+}
+
+/* =============================================================
+   BOOT
+   ============================================================= */
+(async () => {
+  if (state.keys.gemini) {
+    await loadRecipe();
+    if (state.recipe) state.step = 'photo';
+    if (state.keys.anthropic) preflightAnthropic();
+  }
+  render();
+})();
+</script>
+</body>
+</html>

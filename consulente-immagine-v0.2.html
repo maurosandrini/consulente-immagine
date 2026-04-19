@@ -1,0 +1,1084 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Il tuo consulente d'immagine · v0.2</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  html, body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+  .display { font-family: 'Fraunces', Georgia, serif; font-feature-settings: "ss01"; }
+  .fade-in { animation: fadeIn .45s ease-out both; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .spinner { animation: spin .9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .dots span { animation: bounce 1.2s infinite; display: inline-block; }
+  .dots span:nth-child(2) { animation-delay: .15s; }
+  .dots span:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%,60%,100%{transform:translateY(0);opacity:.4} 30%{transform:translateY(-4px);opacity:1} }
+  .chat-scroll::-webkit-scrollbar { width: 4px; }
+  .chat-scroll::-webkit-scrollbar-thumb { background: #d6d3d1; border-radius: 4px; }
+  textarea { field-sizing: content; }
+  details > summary { cursor: pointer; list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+  @media print {
+    .no-print { display: none !important; }
+    body { background: white !important; }
+    .look-card { page-break-inside: avoid; break-inside: avoid; }
+  }
+</style>
+</head>
+<body class="bg-stone-50 min-h-screen text-stone-900">
+<div id="app" class="max-w-3xl mx-auto px-4 py-8 md:py-12"></div>
+<div id="footer" class="max-w-3xl mx-auto px-4 pb-6 text-xs text-stone-400 no-print"></div>
+
+<script>
+/* =============================================================
+   FALLBACK RECIPE (embedded, se fetch fallisce)
+   ============================================================= */
+const FALLBACK_RECIPE = `# RECIPE fallback
+Output: 2-3 look completi (capelli, trucco, rossetto, orecchini). Preserva sempre l'identità del volto. Dialogo veloce. Intervista minima: 3 domande (occasione, aggettivi, vincoli NO). Ogni image_prompt in inglese, vincolato a preservare identità. Checklist avversariale a 7 punti (V1-V7). Log errori in localStorage.`;
+
+/* =============================================================
+   STATE
+   ============================================================= */
+// Migrazione automatica da v0.1
+(function migrateFromV1() {
+  if (!localStorage.getItem('ci2_gemini_key') && localStorage.getItem('ci_gemini_key')) {
+    localStorage.setItem('ci2_gemini_key', localStorage.getItem('ci_gemini_key'));
+  }
+  if (!localStorage.getItem('ci2_user_name') && localStorage.getItem('ci_user_name')) {
+    localStorage.setItem('ci2_user_name', localStorage.getItem('ci_user_name'));
+  }
+})();
+
+const state = {
+  step: 'setup',
+  keys: {
+    gemini: localStorage.getItem('ci2_gemini_key') || '',
+    anthropic: localStorage.getItem('ci2_anthropic_key') || ''
+  },
+  userName: localStorage.getItem('ci2_user_name') || '',
+  mode: localStorage.getItem('ci2_mode') || 'fast', // fast | quality
+  dialogueMode: localStorage.getItem('ci2_dialogue_mode') || 'express', // express | deep
+  recipe: null,
+  photo: { base64: null, dataUrl: null, mime: 'image/jpeg' },
+  faceAnalysis: null,
+  preferences: { occasione: '', aggettivi: '', vincoli_no: '', ulteriori_note_dialogo: '' },
+  dialogue: [],
+  dialogueTurn: 0,
+  MAX_ADAPTIVE: 3,
+  imagePrompts: null,
+  verdicts: null,
+  correctionIterations: {},
+  MAX_CORRECTION_ITER: 2,
+  generatedImages: {},
+  errorLog: JSON.parse(localStorage.getItem('ci2_error_log') || '[]'),
+  isLoading: false,
+  loadingMessage: '',
+  error: null,
+  sessionCostCents: 0,
+  showTechDetails: false
+};
+
+const setState = (patch) => { Object.assign(state, patch); render(); };
+
+/* =============================================================
+   UTIL
+   ============================================================= */
+const el = (tag, attrs = {}, children = []) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') node.className = v;
+    else if (k === 'html') node.innerHTML = v;
+    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (k === 'text') node.textContent = v;
+    else node.setAttribute(k, v);
+  }
+  for (const c of [].concat(children)) if (c) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  return node;
+};
+
+const compressImage = (file, maxSide = 1280, quality = 0.88) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      const dataUrl = canvas.toDataURL('image/jpeg', quality);
+      resolve({ dataUrl, base64: dataUrl.split(',')[1], mime: 'image/jpeg' });
+    };
+    img.onerror = reject;
+    img.src = reader.result;
+  };
+  reader.onerror = reject;
+  reader.readAsDataURL(file);
+});
+
+const extractJson = (text) => {
+  if (!text) return null;
+  const stripped = text.replace(/```(?:json)?\s*|\s*```/g, '').trim();
+  try { return JSON.parse(stripped); } catch {}
+  const match = stripped.match(/\{[\s\S]*\}/);
+  if (match) { try { return JSON.parse(match[0]); } catch {} }
+  return null;
+};
+
+function logError(stage, severity, message, context = {}, recovered = false) {
+  const entry = { ts: new Date().toISOString(), stage, severity, message, context, recovered };
+  state.errorLog.push(entry);
+  try { localStorage.setItem('ci2_error_log', JSON.stringify(state.errorLog.slice(-200))); } catch {}
+  console[severity === 'error' ? 'error' : 'log']('[ci2]', entry);
+}
+
+function trackCost(cents) {
+  state.sessionCostCents += cents;
+  const footer = document.getElementById('footer');
+  if (footer) renderFooter();
+}
+
+/* =============================================================
+   API CALLS — Gemini
+   ============================================================= */
+const GEMINI = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+async function geminiCall(model, parts, opts = {}) {
+  const body = {
+    contents: [{ role: 'user', parts }],
+    generationConfig: {
+      temperature: opts.temperature ?? 0.6,
+      maxOutputTokens: opts.maxTokens ?? 3500,
+      ...(opts.json ? { responseMimeType: 'application/json' } : {}),
+      ...(opts.schema ? { responseSchema: opts.schema } : {}),
+      ...(opts.modalities ? { responseModalities: opts.modalities } : {})
+    }
+  };
+  const res = await fetch(`${GEMINI}/${model}:generateContent?key=${state.keys.gemini}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Gemini ${model} ${res.status}: ${txt.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  trackCost(model.includes('pro') ? 0.5 : 0.1);
+  return { data, parts: data?.candidates?.[0]?.content?.parts || [] };
+}
+
+async function geminiText(model, prompt, opts = {}) {
+  const { parts } = await geminiCall(model, [{ text: prompt }], opts);
+  return parts.map(p => p.text).filter(Boolean).join('\n');
+}
+
+async function geminiVision(prompt, base64, mime = 'image/jpeg', opts = {}) {
+  const parts = [{ text: prompt }, { inlineData: { mimeType: mime, data: base64 } }];
+  const { parts: out } = await geminiCall('gemini-2.5-flash', parts, opts);
+  return out.map(p => p.text).filter(Boolean).join('\n');
+}
+
+async function nanoBanana(promptText, base64, mime = 'image/jpeg') {
+  const candidates = ['gemini-2.5-flash-image', 'gemini-2.5-flash-image-preview'];
+  let lastErr = null;
+  for (const model of candidates) {
+    try {
+      const parts = [{ text: promptText }, { inlineData: { mimeType: mime, data: base64 } }];
+      const { parts: out } = await geminiCall(model, parts, { modalities: ['TEXT', 'IMAGE'], maxTokens: 8000 });
+      trackCost(3);
+      for (const p of out) {
+        const inline = p.inlineData || p.inline_data;
+        if (inline?.data) {
+          const mt = inline.mimeType || inline.mime_type || 'image/png';
+          return `data:${mt};base64,${inline.data}`;
+        }
+      }
+      lastErr = new Error(`${model}: nessuna immagine nella risposta`);
+    } catch (e) { lastErr = e; logError('images', 'warn', `${model} failed`, { error: e.message }, true); }
+  }
+  throw lastErr || new Error('Nano Banana: errore sconosciuto');
+}
+
+/* =============================================================
+   API CALLS — Anthropic (via direct browser access)
+   ============================================================= */
+async function anthropicCall(messages, opts = {}) {
+  if (!state.keys.anthropic) throw new Error('NO_ANTHROPIC_KEY');
+  const model = opts.model || (state.mode === 'quality' ? 'claude-opus-4-7' : 'claude-haiku-4-5-20251001');
+  const body = {
+    model,
+    max_tokens: opts.maxTokens || 3000,
+    messages,
+    ...(opts.system ? { system: opts.system } : {})
+  };
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': state.keys.anthropic,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Anthropic ${model} ${res.status}: ${txt.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  trackCost(model.includes('opus') ? 2 : 0.3);
+  const text = (data?.content || []).filter(p => p.type === 'text').map(p => p.text).join('\n');
+  return text;
+}
+
+/**
+ * Entry point unificato per step "intelligenti": preferisci Anthropic se disponibile, altrimenti Gemini Pro.
+ */
+async function smartReason(system, user, opts = {}) {
+  if (state.keys.anthropic) {
+    try {
+      return await anthropicCall([{ role: 'user', content: user }], { system, ...opts });
+    } catch (e) {
+      logError(opts.stage || 'smart', 'warn', `Anthropic failed, fallback Gemini`, { error: e.message }, true);
+    }
+  }
+  const combined = `${system}\n\n---\n\n${user}`;
+  return await geminiText('gemini-2.5-pro', combined, { json: true, maxTokens: opts.maxTokens || 3000 });
+}
+
+/* =============================================================
+   SCHEMA — Gemini structured output
+   ============================================================= */
+const PROMPTS_SCHEMA = {
+  type: 'object',
+  properties: {
+    intro: { type: 'string' },
+    looks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          vibe: { type: 'string' },
+          hair: {
+            type: 'object',
+            properties: {
+              taglio: { type: 'string' },
+              colore: { type: 'string' },
+              styling: { type: 'string' }
+            }
+          },
+          makeup: {
+            type: 'object',
+            properties: {
+              base: { type: 'string' },
+              occhi: { type: 'string' },
+              sopracciglia: { type: 'string' }
+            }
+          },
+          lipstick: { type: 'string' },
+          earrings: { type: 'string' },
+          perche_ti_sta: { type: 'string' },
+          english_prompt: { type: 'string' }
+        }
+      }
+    }
+  }
+};
+
+const DIALOGUE_SCHEMA = {
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: ['ask', 'done'] },
+    question: { type: 'string' },
+    summary: { type: 'string' }
+  },
+  required: ['action']
+};
+
+/* =============================================================
+   STEP 0 — RECIPE
+   ============================================================= */
+async function loadRecipe() {
+  try {
+    const res = await fetch('./RECIPE.md');
+    if (res.ok) {
+      state.recipe = await res.text();
+      logError('recipe', 'info', 'RECIPE.md caricata da file', { size: state.recipe.length });
+      return;
+    }
+  } catch (e) { /* fall through */ }
+  state.recipe = FALLBACK_RECIPE;
+  logError('recipe', 'warn', 'fetch RECIPE.md fallito, uso FALLBACK_RECIPE', {}, true);
+}
+
+/* =============================================================
+   STEP 1 — VISION
+   ============================================================= */
+const VISION_PROMPT = (recipe) => `Sei un consulente d'immagine. Analizza la foto con occhio professionale, sintetizza in JSON valido. NON giudizi estetici, solo osservazioni fattuali.
+
+RECIPE di riferimento:
+${recipe}
+
+Rispondi SOLO con JSON:
+{
+  "forma_viso": "ovale|tondo|squadrato|cuore|lungo|diamante",
+  "lineamenti": "descrizione sintetica zigomi, mento, fronte",
+  "carnagione": "chiara|medio-chiara|media|olivastra|scura + undertone fredda|calda|neutra",
+  "occhi": { "colore": "...", "forma": "..." },
+  "sopracciglia": "colore, spessore, forma",
+  "capelli_attuali": { "lunghezza": "...", "texture": "lisci|mossi|ricci|afro", "colore": "...", "volume": "..." },
+  "trucco_visibile": "nessuno|naturale|marcato + dettagli",
+  "accessori_visibili": "nessuno|descrizione",
+  "note": "dettagli utili"
+}`;
+
+async function runVision() {
+  setState({ step: 'analyzing', loadingMessage: 'Nayla sta guardando la tua foto...', error: null });
+  try {
+    const raw = await geminiVision(VISION_PROMPT(state.recipe), state.photo.base64, state.photo.mime, { json: true, maxTokens: 1000 });
+    const json = extractJson(raw) || { raw };
+    state.faceAnalysis = json;
+    logError('vision', 'info', 'analisi foto completata', { fields: Object.keys(json).length });
+    setState({ step: 'interview' });
+  } catch (e) {
+    logError('vision', 'error', e.message, {}, false);
+    setState({ error: `Analisi foto fallita: ${e.message}`, step: 'photo' });
+  }
+}
+
+/* =============================================================
+   STEP 2 — INTERVIEW
+   ============================================================= */
+async function runDialogueTurn(retry = 0) {
+  const system = `Sei "Nayla", consulente d'immagine italiana, calda e concreta. Stai parlando con ${state.userName || 'la tua cliente'}.
+
+${state.recipe}
+
+Analisi foto:
+${JSON.stringify(state.faceAnalysis, null, 2)}
+
+Risposte iniziali:
+${JSON.stringify(state.preferences, null, 2)}
+
+Dialogo finora:
+${state.dialogue.map(m => `${m.role === 'user' ? 'LEI' : 'TU'}: ${m.content}`).join('\n') || '(vuoto)'}
+
+Sei al turno adattivo ${state.dialogueTurn + 1}/${state.MAX_ADAPTIVE}.
+
+Decidi:
+- action=ask: fai UNA domanda concreta, una sola frase, calda. Solo se ti manca davvero un'informazione che cambia i look.
+- action=done: dichiari di aver abbastanza info, generi un "summary" italiano di 1-2 frasi che riassume le preferenze emerse dal dialogo adattivo.
+
+IMPORTANTE: rispondi ESCLUSIVAMENTE con un oggetto JSON valido. Nessun testo prima o dopo. Nessun markdown. Nessun backtick. Formati validi:
+{"action":"ask","question":"testo della domanda"}
+{"action":"done","summary":"riassunto di 1-2 frasi"}`;
+
+  const raw = await geminiText(state.mode === 'quality' ? 'gemini-2.5-pro' : 'gemini-2.5-flash',
+    system, { json: true, schema: DIALOGUE_SCHEMA, maxTokens: 600, temperature: retry === 0 ? 0.6 : 0.2 });
+  const json = extractJson(raw);
+  if (!json || !json.action) {
+    logError('interview', 'warn', 'JSON non parsabile', { raw: (raw || '').slice(0, 300), retry }, retry < 1);
+    if (retry < 1) return runDialogueTurn(retry + 1);
+  }
+  return json;
+}
+
+async function dialogueStep() {
+  state.isLoading = true; state.loadingMessage = 'Nayla sta pensando...'; render();
+  try {
+    const json = await runDialogueTurn();
+    state.isLoading = false;
+    if (json?.action === 'ask' && json.question) {
+      state.dialogue.push({ role: 'assistant', content: json.question });
+      state.dialogueTurn += 1;
+      render();
+    } else if (json?.action === 'done' || state.dialogueTurn >= state.MAX_ADAPTIVE) {
+      if (json?.summary) state.preferences.ulteriori_note_dialogo = json.summary;
+      await generatePrompts();
+    } else {
+      // Graceful fallback: saltiamo al propose invece di bloccare l'utente
+      logError('interview', 'warn', 'Dialogo adattivo non interpretabile, salto ai look', {}, true);
+      state.preferences.ulteriori_note_dialogo = state.dialogue.filter(m => m.role === 'user').map(m => m.content).join(' | ') || '(nessuna nota aggiuntiva)';
+      await generatePrompts();
+    }
+  } catch (e) {
+    state.isLoading = false;
+    logError('interview', 'error', e.message, {}, false);
+    // fallback più aggressivo: procedi comunque
+    state.preferences.ulteriori_note_dialogo = state.dialogue.filter(m => m.role === 'user').map(m => m.content).join(' | ') || '(nessuna nota aggiuntiva)';
+    await generatePrompts();
+  }
+}
+
+async function userReply(text) {
+  if (!text.trim()) return;
+  state.dialogue.push({ role: 'user', content: text.trim() });
+  render();
+  await dialogueStep();
+}
+
+/* =============================================================
+   STEP 3 — PROMPT GENERATOR
+   ============================================================= */
+async function generatePrompts() {
+  setState({ step: 'generating_prompts', loadingMessage: 'Nayla sta costruendo le proposte...', error: null });
+
+  const system = `Sei "Nayla", consulente d'immagine italiana senior. Genera ESATTAMENTE 3 proposte di look diverse tra loro (una più sicura, una più sperimentale, una di contrasto), complete di tutti i campi.
+
+${state.recipe}
+
+Analisi foto:
+${JSON.stringify(state.faceAnalysis, null, 2)}
+
+Preferenze utente:
+${JSON.stringify(state.preferences, null, 2)}
+
+OBBLIGO per english_prompt: deve iniziare con "Photorealistic portrait. Preserve subject identity exactly: face shape, skin tone, eye color, eye shape, nose, mouth unchanged." Poi descrivi nel dettaglio hair, makeup, lipstick, earrings, lighting. Max 150 parole.
+
+Rispondi SOLO con JSON:
+{
+  "intro": "1-2 frasi di presentazione",
+  "looks": [
+    {
+      "title": "...",
+      "vibe": "...",
+      "hair": {"taglio": "...", "colore": "...", "styling": "..."},
+      "makeup": {"base": "...", "occhi": "...", "sopracciglia": "..."},
+      "lipstick": "...",
+      "earrings": "...",
+      "perche_ti_sta": "...",
+      "english_prompt": "Photorealistic portrait. Preserve subject identity exactly: ..."
+    },
+    {...},
+    {...}
+  ]
+}`;
+
+  try {
+    const raw = await geminiText('gemini-2.5-pro', system, { json: true, schema: PROMPTS_SCHEMA, maxTokens: 4000, temperature: 0.7 });
+    const json = extractJson(raw);
+    if (!json || !Array.isArray(json.looks) || json.looks.length === 0) throw new Error('Prompts non generati');
+    state.imagePrompts = json.looks.slice(0, 3);
+    state.intro = json.intro || '';
+    logError('prompts', 'info', `Generati ${state.imagePrompts.length} prompt`, {});
+    await runAdversarialCheck();
+  } catch (e) {
+    logError('prompts', 'error', e.message, {}, false);
+    setState({ error: `Generazione prompt fallita: ${e.message}` });
+  }
+}
+
+/* =============================================================
+   STEP 4 — ADVERSARIAL CHECK
+   ============================================================= */
+async function runAdversarialCheck() {
+  setState({ step: 'adversarial', loadingMessage: 'Opus sta verificando le proposte...', error: null });
+
+  const system = `Sei un agente avversariale. Il tuo compito è verificare se ogni image_prompt rispetta 7 regole ferree derivate dalla RECIPE. Sei severo ma giusto. Per ogni check cita EVIDENZA TESTUALE dal prompt. Se non trovi evidenza → il check fallisce.
+
+RECIPE (regole vincolanti):
+${state.recipe}
+
+DIALOGO UTENTE (riferimento per V2, V3, V4):
+Preferenze iniziali: ${JSON.stringify(state.preferences)}
+Dialogo adattivo: ${state.dialogue.map(m => `${m.role}: ${m.content}`).join(' | ') || '(nessuno)'}
+
+PROMPT DA VERIFICARE:
+${JSON.stringify(state.imagePrompts.map((p, i) => ({ index: i, title: p.title, english_prompt: p.english_prompt, hair: p.hair, makeup: p.makeup, lipstick: p.lipstick, earrings: p.earrings })), null, 2)}
+
+CHECKLIST (per ciascuno dei 3 prompt):
+- V1 preserve_identity: il prompt contiene clausola esplicita di preservazione del volto?
+- V2 cites_dialogue: il prompt cita almeno 2 elementi concreti emersi dal dialogo (aggettivi, occasione, vincoli)?
+- V3 respects_no: rispetta tutti i "NO" dichiarati dall'utente?
+- V4 coherent_adjectives: coerente con gli aggettivi aspirazionali?
+- V5 covers_all_4: specifica hair + makeup + lipstick + earrings?
+- V6 no_invented: NON introduce elementi non discussi?
+- V7 clean_english: inglese pulito, < 150 parole, implementabile?
+
+Rispondi SOLO con JSON:
+{
+  "verdicts": [
+    {
+      "prompt_index": 0,
+      "verdict": "pass" | "fail",
+      "checks": {
+        "V1_preserve_identity": {"pass": true, "evidence": "citazione testuale"},
+        "V2_cites_dialogue": {"pass": true, "evidence": "..."},
+        "V3_respects_no": {"pass": true, "evidence": "..."},
+        "V4_coherent_adjectives": {"pass": true, "evidence": "..."},
+        "V5_covers_all_4": {"pass": true, "evidence": "..."},
+        "V6_no_invented": {"pass": true, "evidence": "..."},
+        "V7_clean_english": {"pass": true, "evidence": "..."}
+      },
+      "fix_hint": "null se verdict=pass; se fail, istruzione SPECIFICA per correggere (solo cosa cambiare, non riscrivere tutto)"
+    },
+    ...
+  ]
+}`;
+
+  try {
+    const raw = await smartReason(system, 'Esegui la verifica adversariale ora.', { stage: 'adversarial', maxTokens: 4000 });
+    const json = extractJson(raw);
+    if (!json?.verdicts) throw new Error('Adversarial: output non interpretabile');
+    state.verdicts = json.verdicts;
+    const failing = json.verdicts.filter(v => v.verdict === 'fail');
+    logError('adversarial', 'info', `${json.verdicts.length} verdetti, ${failing.length} fail`, {});
+    if (failing.length === 0) {
+      await generateAllImages();
+    } else {
+      await runCorrector(failing);
+    }
+  } catch (e) {
+    logError('adversarial', 'warn', `Adversarial fallito, procedo senza check: ${e.message}`, {}, true);
+    // graceful degradation
+    await generateAllImages();
+  }
+}
+
+/* =============================================================
+   STEP 5 — CORRECTOR
+   ============================================================= */
+async function runCorrector(failingVerdicts) {
+  setState({ step: 'correcting', loadingMessage: `Nayla sta rifinendo ${failingVerdicts.length} proposte...`, error: null });
+
+  const toFix = failingVerdicts.filter(v => (state.correctionIterations[v.prompt_index] || 0) < state.MAX_CORRECTION_ITER);
+
+  if (toFix.length === 0) {
+    logError('correction', 'warn', 'Max iterazioni raggiunte, procedo con prompt originali', { indices: failingVerdicts.map(v => v.prompt_index) }, true);
+    await generateAllImages();
+    return;
+  }
+
+  const system = `Sei un agente di correzione. Ricevi 1 o più image_prompt flaggati come "fail" dall'adversarial check, con un fix_hint SPECIFICO per ciascuno. Il tuo compito: applicare MINIMAMENTE il fix_hint, SENZA stravolgere il prompt. Cambia solo ciò che serve.
+
+RECIPE (regole vincolanti):
+${state.recipe}
+
+PROMPT DA CORREGGERE:
+${JSON.stringify(toFix.map(v => ({ index: v.prompt_index, original: state.imagePrompts[v.prompt_index], fix_hint: v.fix_hint })), null, 2)}
+
+Rispondi SOLO con JSON:
+{
+  "corrected": [
+    {
+      "index": 0,
+      "english_prompt": "nuova versione con fix applicato",
+      "title": "... (può essere lasciato uguale)",
+      "hair": {...}, "makeup": {...}, "lipstick": "...", "earrings": "...",
+      "vibe": "...", "perche_ti_sta": "..."
+    },
+    ...
+  ]
+}`;
+
+  try {
+    const raw = await smartReason(system, 'Correggi i prompt ora.', { stage: 'correction', maxTokens: 3000 });
+    const json = extractJson(raw);
+    if (!json?.corrected) throw new Error('Corrector: output non interpretabile');
+    for (const c of json.corrected) {
+      if (typeof c.index !== 'number') continue;
+      state.correctionIterations[c.index] = (state.correctionIterations[c.index] || 0) + 1;
+      state.imagePrompts[c.index] = { ...state.imagePrompts[c.index], ...c };
+    }
+    logError('correction', 'info', `Corretti ${json.corrected.length} prompt`, { indices: json.corrected.map(c => c.index) });
+    await runAdversarialCheck();
+  } catch (e) {
+    logError('correction', 'warn', `Corrector fallito: ${e.message}, procedo`, {}, true);
+    await generateAllImages();
+  }
+}
+
+/* =============================================================
+   STEP 6 — IMAGE GEN (parallel)
+   ============================================================= */
+async function generateAllImages() {
+  setState({ step: 'generating', loadingMessage: 'Sto disegnando i tuoi look...', error: null });
+  state.generatedImages = {};
+  render();
+  const tasks = state.imagePrompts.map((look, i) => generateOne(i, look));
+  await Promise.all(tasks);
+  setState({ step: 'results' });
+}
+
+async function generateOne(i, look, retry = 0) {
+  try {
+    const img = await nanoBanana(look.english_prompt, state.photo.base64, state.photo.mime);
+    state.generatedImages[i] = img;
+    logError('images', 'info', `Immagine ${i} generata`, {});
+    render();
+  } catch (e) {
+    if (retry < 1) {
+      logError('images', 'warn', `Retry immagine ${i}`, { error: e.message }, true);
+      return generateOne(i, look, retry + 1);
+    }
+    logError('images', 'error', `Immagine ${i} fallita dopo retry`, { error: e.message }, false);
+    state.generatedImages[i] = { error: e.message };
+    render();
+  }
+}
+
+/* =============================================================
+   RESET
+   ============================================================= */
+function resetSession() {
+  state.photo = { base64: null, dataUrl: null, mime: 'image/jpeg' };
+  state.faceAnalysis = null;
+  state.preferences = { occasione: '', aggettivi: '', vincoli_no: '', ulteriori_note_dialogo: '' };
+  state.dialogue = []; state.dialogueTurn = 0;
+  state.imagePrompts = null; state.verdicts = null;
+  state.correctionIterations = {}; state.generatedImages = {};
+  state.error = null; state.sessionCostCents = 0;
+  setState({ step: 'photo' });
+}
+
+function clearKeys() {
+  if (!confirm('Cancellare le API key salvate?')) return;
+  localStorage.removeItem('ci2_gemini_key');
+  localStorage.removeItem('ci2_anthropic_key');
+  state.keys = { gemini: '', anthropic: '' };
+  setState({ step: 'setup' });
+}
+
+function downloadLog() {
+  const blob = new Blob([JSON.stringify(state.errorLog, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `consulente-immagine-log-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* =============================================================
+   RENDER
+   ============================================================= */
+function render() {
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  app.appendChild(renderHeader());
+  if (state.error) app.appendChild(renderError());
+  const step = ({
+    setup: renderSetup, photo: renderPhoto, analyzing: renderLoading,
+    interview: renderInterview, dialogue: renderDialogue,
+    generating_prompts: renderLoading, adversarial: renderLoading,
+    correcting: renderLoading, generating: renderGenerating,
+    results: renderResults
+  })[state.step];
+  if (step) app.appendChild(step());
+  renderFooter();
+}
+
+function renderFooter() {
+  const footer = document.getElementById('footer');
+  footer.innerHTML = '';
+  const left = el('span', {}, `v0.2 · modalità ${state.mode.toUpperCase()} · costo sessione ~€${(state.sessionCostCents/100).toFixed(3)}`);
+  const right = el('span', { class: 'float-right' });
+  if (state.errorLog.length > 0) {
+    right.appendChild(el('button', {
+      class: 'underline hover:text-stone-700 mr-3',
+      onclick: downloadLog
+    }, `📥 log (${state.errorLog.length})`));
+  }
+  if (state.step !== 'setup') {
+    right.appendChild(el('button', {
+      class: 'underline hover:text-stone-700 mr-3',
+      onclick: () => setState({ step: 'setup' })
+    }, '⚙ impostazioni'));
+    right.appendChild(el('button', {
+      class: 'underline hover:text-stone-700',
+      onclick: clearKeys
+    }, 'reset chiavi'));
+  }
+  footer.append(left, right);
+}
+
+function renderHeader() {
+  return el('header', { class: 'mb-8 text-center fade-in no-print' }, [
+    el('p', { class: 'text-[10px] tracking-[0.35em] text-stone-500 uppercase mb-2', text: 'v0.2 · privato · self-verifying' }),
+    el('h1', { class: 'display text-4xl md:text-5xl font-light text-stone-900 leading-tight', text: "Il tuo consulente d'immagine" }),
+    el('p', { class: 'text-stone-600 mt-3 max-w-lg mx-auto', text: 'Una foto, poche domande, tre proposte di look verificate da Nayla.' })
+  ]);
+}
+
+function renderError() {
+  return el('div', { class: 'mb-6 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800 fade-in no-print' }, [
+    el('div', { class: 'font-medium mb-1', text: 'Qualcosa è andato storto' }),
+    el('div', { text: state.error }),
+    el('button', { class: 'mt-2 text-xs underline', onclick: () => setState({ error: null }) }, 'Chiudi')
+  ]);
+}
+
+function renderSetup() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-6 md:p-8 fade-in' });
+  wrap.appendChild(el('h2', { class: 'display text-2xl mb-4', text: 'Setup iniziale (una volta sola)' }));
+
+  const nameInput = el('input', {
+    type: 'text', placeholder: 'Nome',
+    class: 'w-full px-4 py-3 rounded-lg border border-stone-300 focus:outline-none focus:border-stone-900 mb-4',
+    value: state.userName
+  });
+
+  wrap.appendChild(el('label', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-1 block', text: 'Nome' }));
+  wrap.appendChild(nameInput);
+
+  wrap.appendChild(el('label', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-1 block', text: 'API key Google Gemini (richiesta)' }));
+  const geminiInput = el('input', {
+    type: 'password', placeholder: 'AIza...',
+    class: 'w-full px-4 py-3 rounded-lg border border-stone-300 focus:outline-none focus:border-stone-900 mb-1 font-mono text-sm',
+    value: state.keys.gemini
+  });
+  wrap.appendChild(geminiInput);
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-4', html: 'La ottieni in 30 sec su <a class="underline text-stone-900" href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio</a> (gratis).' }));
+
+  wrap.appendChild(el('label', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-1 block', text: 'API key Anthropic (opzionale, per modalità QUALITY)' }));
+  const anthInput = el('input', {
+    type: 'password', placeholder: 'sk-ant-api03-...',
+    class: 'w-full px-4 py-3 rounded-lg border border-stone-300 focus:outline-none focus:border-stone-900 mb-1 font-mono text-sm',
+    value: state.keys.anthropic
+  });
+  wrap.appendChild(anthInput);
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-6', html: 'Opzionale: sblocca Claude Opus per il controllo adversariale. La crei su <a class="underline text-stone-900" href="https://console.anthropic.com/settings/keys" target="_blank">Anthropic Console</a>. Senza, la verifica usa Gemini Pro.' }));
+
+  wrap.appendChild(el('label', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-2 block', text: 'Modalità' }));
+  const modeWrap = el('div', { class: 'flex gap-2 mb-4' });
+  ['fast', 'quality'].forEach(m => {
+    const btn = el('button', {
+      class: `flex-1 py-2 px-3 rounded-lg text-sm border ${state.mode === m ? 'bg-stone-900 text-white border-stone-900' : 'bg-white text-stone-700 border-stone-300 hover:bg-stone-50'}`,
+      onclick: () => { state.mode = m; render(); }
+    }, m === 'fast' ? '⚡ FAST (Haiku)' : '✨ QUALITY (Opus)');
+    modeWrap.appendChild(btn);
+  });
+  wrap.appendChild(modeWrap);
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mb-6', text: state.mode === 'fast' ? 'Più veloce, ~€0.10/sessione. Consigliato per uso quotidiano.' : 'Controlli più rigorosi, ~€0.25/sessione. Consigliato per occasioni importanti.' }));
+
+  wrap.appendChild(el('label', { class: 'text-xs text-stone-500 uppercase tracking-wider mb-2 block', text: 'Dialogo' }));
+  const dialogWrap = el('div', { class: 'flex gap-2 mb-4' });
+  ['express', 'deep'].forEach(m => {
+    const btn = el('button', {
+      class: `flex-1 py-2 px-3 rounded-lg text-sm border ${state.dialogueMode === m ? 'bg-stone-900 text-white border-stone-900' : 'bg-white text-stone-700 border-stone-300 hover:bg-stone-50'}`,
+      onclick: () => { state.dialogueMode = m; render(); }
+    }, m === 'express' ? '🚀 EXPRESS (3 domande)' : '🌿 DEEP (+ dialogo adattivo)');
+    dialogWrap.appendChild(btn);
+  });
+  wrap.appendChild(dialogWrap);
+
+  const btn = el('button', {
+    class: 'mt-4 w-full py-3 rounded-lg bg-stone-900 text-white font-medium hover:bg-stone-800 transition',
+    onclick: async () => {
+      if (!geminiInput.value.trim()) { setState({ error: 'Serve almeno la chiave Gemini.' }); return; }
+      localStorage.setItem('ci2_gemini_key', geminiInput.value.trim());
+      localStorage.setItem('ci2_anthropic_key', anthInput.value.trim());
+      localStorage.setItem('ci2_user_name', nameInput.value.trim());
+      localStorage.setItem('ci2_mode', state.mode);
+      localStorage.setItem('ci2_dialogue_mode', state.dialogueMode);
+      state.keys.gemini = geminiInput.value.trim();
+      state.keys.anthropic = anthInput.value.trim();
+      state.userName = nameInput.value.trim();
+      await loadRecipe();
+      setState({ step: 'photo' });
+    }
+  }, 'Inizia →');
+
+  wrap.appendChild(btn);
+  return wrap;
+}
+
+function renderPhoto() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-6 md:p-8 fade-in' });
+  wrap.appendChild(el('h2', { class: 'display text-2xl mb-2', text: `Ciao${state.userName ? ' ' + state.userName : ''}, carica la foto.` }));
+  wrap.appendChild(el('p', { class: 'text-sm text-stone-600 mb-6', text: 'Primo piano o mezzo busto, luce naturale, senza occhiali da sole. Tutto resta sul tuo browser.' }));
+
+  const input = el('input', { type: 'file', accept: 'image/*', class: 'hidden' });
+  input.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const r = await compressImage(file);
+      state.photo = r;
+      setState({});
+    } catch (err) { setState({ error: 'Impossibile leggere la foto.' }); logError('photo', 'error', err.message, {}, false); }
+  });
+
+  const dropzone = el('label', {
+    class: 'block border-2 border-dashed border-stone-300 rounded-xl p-8 text-center cursor-pointer hover:border-stone-500 transition'
+  });
+  if (state.photo.dataUrl) {
+    dropzone.appendChild(el('img', { src: state.photo.dataUrl, class: 'mx-auto max-h-72 rounded-lg mb-3' }));
+    dropzone.appendChild(el('p', { class: 'text-sm text-stone-600', text: 'Clicca per cambiare foto' }));
+  } else {
+    dropzone.appendChild(el('div', { class: 'text-stone-400 text-6xl mb-3 display', text: '+' }));
+    dropzone.appendChild(el('p', { class: 'text-sm text-stone-600', text: 'Clicca o trascina qui la foto' }));
+  }
+  dropzone.appendChild(input);
+  dropzone.addEventListener('dragover', e => e.preventDefault());
+  dropzone.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0]; if (!file) return;
+    try { state.photo = await compressImage(file); setState({}); }
+    catch (err) { setState({ error: 'Impossibile leggere la foto.' }); }
+  });
+
+  const btn = el('button', {
+    class: `mt-6 w-full py-3 rounded-lg font-medium transition ${state.photo.base64 ? 'bg-stone-900 text-white hover:bg-stone-800' : 'bg-stone-200 text-stone-400 cursor-not-allowed'}`,
+    onclick: () => state.photo.base64 && runVision()
+  }, state.photo.base64 ? 'Analizza la foto →' : 'Prima carica una foto');
+  wrap.append(dropzone, btn);
+  return wrap;
+}
+
+function renderLoading() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-8 text-center fade-in' });
+  wrap.appendChild(el('div', { class: 'inline-block w-10 h-10 border-2 border-stone-300 border-t-stone-900 rounded-full spinner mb-4' }));
+  wrap.appendChild(el('p', { class: 'display text-xl text-stone-800', text: state.loadingMessage || 'Sto lavorando...' }));
+  return wrap;
+}
+
+function renderInterview() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-6 md:p-8 fade-in' });
+  wrap.appendChild(el('h2', { class: 'display text-2xl mb-2', text: 'Tre domande.' }));
+  wrap.appendChild(el('p', { class: 'text-sm text-stone-600 mb-6', text: state.dialogueMode === 'express' ? 'Poi passiamo direttamente alle proposte.' : 'Poi Nayla ti farà eventuali domande di approfondimento.' }));
+
+  const questions = [
+    { key: 'occasione', label: 'Per che occasione?', hint: 'Quotidiano, evento specifico, nuovo capitolo...', placeholder: 'Es. matrimonio di un\'amica a giugno' },
+    { key: 'aggettivi', label: 'Come vuoi sentirti?', hint: '2-3 aggettivi aspirazionali', placeholder: 'Es. raffinata, fresca, un po\' audace' },
+    { key: 'vincoli_no', label: 'Cosa NON vuoi?', hint: 'Vincoli assoluti: colori, tagli, stili da evitare', placeholder: 'Es. niente biondo, niente frangia, niente rossetti scuri' }
+  ];
+
+  questions.forEach(q => {
+    const wrapQ = el('div', { class: 'mb-5' });
+    wrapQ.appendChild(el('label', { class: 'block text-sm font-medium text-stone-800 mb-1', text: q.label }));
+    wrapQ.appendChild(el('p', { class: 'text-xs text-stone-500 mb-2', text: q.hint }));
+    const ta = el('textarea', {
+      class: 'w-full px-3 py-2 rounded-lg border border-stone-300 text-sm focus:outline-none focus:border-stone-900 min-h-[60px]',
+      placeholder: q.placeholder,
+      rows: 2
+    });
+    ta.value = state.preferences[q.key];
+    ta.addEventListener('input', e => { state.preferences[q.key] = e.target.value; });
+    wrapQ.appendChild(ta);
+    wrap.appendChild(wrapQ);
+  });
+
+  const btn = el('button', {
+    class: 'mt-4 w-full py-3 rounded-lg bg-stone-900 text-white font-medium hover:bg-stone-800 transition',
+    onclick: () => {
+      const allFilled = ['occasione', 'aggettivi', 'vincoli_no'].every(k => state.preferences[k].trim().length > 0);
+      if (!allFilled) { setState({ error: 'Rispondi a tutte e 3, anche con una frase breve.' }); return; }
+      if (state.dialogueMode === 'deep') {
+        setState({ step: 'dialogue' });
+        dialogueStep();
+      } else {
+        generatePrompts();
+      }
+    }
+  }, state.dialogueMode === 'deep' ? 'Passiamo al dialogo con Nayla →' : 'Genera le proposte →');
+  wrap.appendChild(btn);
+  return wrap;
+}
+
+function renderDialogue() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-6 md:p-8 fade-in flex flex-col' });
+  wrap.appendChild(el('div', { class: 'flex items-center justify-between mb-4' }, [
+    el('h2', { class: 'display text-2xl', text: 'Dialogo con Nayla' }),
+    el('span', { class: 'text-xs text-stone-500', text: `turno ${state.dialogueTurn}/${state.MAX_ADAPTIVE}` })
+  ]));
+
+  const chat = el('div', { class: 'chat-scroll flex-1 overflow-y-auto max-h-[55vh] pr-2 mb-4 space-y-3' });
+  state.dialogue.forEach(m => {
+    const bubble = el('div', {
+      class: m.role === 'assistant'
+        ? 'max-w-[85%] bg-stone-100 text-stone-900 rounded-2xl rounded-tl-sm px-4 py-3 text-sm'
+        : 'max-w-[85%] bg-stone-900 text-white rounded-2xl rounded-tr-sm px-4 py-3 text-sm ml-auto'
+    }, m.content);
+    chat.appendChild(el('div', { class: m.role === 'user' ? 'flex justify-end' : 'flex' }, bubble));
+  });
+  if (state.isLoading) {
+    chat.appendChild(el('div', { class: 'flex' }, el('div', { class: 'max-w-[85%] bg-stone-100 rounded-2xl rounded-tl-sm px-4 py-3 text-sm dots' }, [
+      el('span', { text: '·' }), el('span', { text: '·' }), el('span', { text: '·' })
+    ])));
+  }
+  wrap.appendChild(chat);
+
+  if (!state.isLoading && state.dialogue.length && state.dialogue[state.dialogue.length - 1].role === 'assistant') {
+    const ta = el('textarea', {
+      class: 'w-full px-3 py-3 rounded-lg border border-stone-300 text-sm focus:outline-none focus:border-stone-900 min-h-[70px] mb-2',
+      placeholder: 'Rispondi qui...',
+      rows: 2
+    });
+    const send = () => { const t = ta.value; ta.value = ''; userReply(t); };
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
+    });
+    const btn = el('button', {
+      class: 'w-full py-2 rounded-lg bg-stone-900 text-white text-sm font-medium hover:bg-stone-800 transition',
+      onclick: send
+    }, 'Invia (⌘+Enter)');
+    wrap.append(ta, btn);
+
+    wrap.appendChild(el('button', {
+      class: 'mt-3 w-full py-2 rounded-lg border-2 border-stone-900 text-stone-900 text-sm font-medium hover:bg-stone-900 hover:text-white transition',
+      onclick: () => {
+        state.preferences.ulteriori_note_dialogo = state.dialogue.filter(m => m.role === 'user').map(m => m.content).join(' | ');
+        generatePrompts();
+      }
+    }, '✨ Proponi ora i look (basta domande)'));
+  }
+  return wrap;
+}
+
+function renderGenerating() {
+  const wrap = el('div', { class: 'bg-white rounded-2xl shadow-sm border border-stone-200 p-8 fade-in' });
+  wrap.appendChild(el('div', { class: 'flex items-center gap-3 mb-4' }, [
+    el('div', { class: 'w-5 h-5 border-2 border-stone-300 border-t-stone-900 rounded-full spinner' }),
+    el('h2', { class: 'display text-xl', text: 'Sto disegnando i tuoi look...' })
+  ]));
+  const list = el('div', { class: 'space-y-2' });
+  state.imagePrompts.forEach((look, i) => {
+    const done = state.generatedImages[i];
+    const status = done ? (done.error ? '✕' : '✓') : '…';
+    const color = done ? (done.error ? 'text-rose-500' : 'text-emerald-600') : 'text-stone-400';
+    list.appendChild(el('div', { class: 'flex items-center gap-3 text-sm' }, [
+      el('span', { class: `${color} font-mono`, text: status }),
+      el('span', { text: look.title })
+    ]));
+  });
+  wrap.appendChild(list);
+  wrap.appendChild(el('p', { class: 'text-xs text-stone-500 mt-4', text: 'Generazione in parallelo, ~30-45 secondi.' }));
+  return wrap;
+}
+
+function renderResults() {
+  const container = el('div', { class: 'space-y-6 fade-in' });
+
+  const toolbar = el('div', { class: 'flex items-center justify-between no-print flex-wrap gap-2' }, [
+    el('h2', { class: 'display text-2xl', text: 'Ecco i tuoi look' }),
+    el('div', { class: 'flex gap-2 flex-wrap' }, [
+      el('button', {
+        class: 'px-3 py-2 text-sm rounded-lg border border-stone-300 hover:bg-stone-100',
+        onclick: () => { state.generatedImages = {}; generateAllImages(); }
+      }, '↻ Rigenera immagini'),
+      el('button', {
+        class: 'px-3 py-2 text-sm rounded-lg border border-stone-300 hover:bg-stone-100',
+        onclick: () => window.print()
+      }, '🖨 Stampa'),
+      el('button', {
+        class: 'px-3 py-2 text-sm rounded-lg border border-stone-300 hover:bg-stone-100',
+        onclick: resetSession
+      }, '↻ Nuovo look')
+    ])
+  ]);
+  container.appendChild(toolbar);
+
+  if (state.intro) container.appendChild(el('p', { class: 'text-stone-700 italic', text: state.intro }));
+
+  state.imagePrompts.forEach((look, i) => {
+    const img = state.generatedImages[i];
+    const verdict = state.verdicts?.find(v => v.prompt_index === i);
+    const card = el('div', { class: 'look-card bg-white rounded-2xl shadow-sm border border-stone-200 overflow-hidden' });
+    const grid = el('div', { class: 'grid md:grid-cols-2' });
+
+    const imgCol = el('div', { class: 'bg-stone-100 p-4 flex flex-col gap-3 items-center justify-center' });
+    imgCol.appendChild(el('p', { class: 'text-[10px] tracking-[0.2em] uppercase text-stone-500', text: 'Prima → Dopo' }));
+    const pair = el('div', { class: 'flex gap-3 w-full justify-center' });
+    pair.appendChild(el('img', { src: state.photo.dataUrl, class: 'w-1/2 max-w-[160px] rounded-lg object-cover' }));
+    if (typeof img === 'string') {
+      pair.appendChild(el('img', { src: img, class: 'w-1/2 max-w-[160px] rounded-lg object-cover' }));
+    } else if (img && img.error) {
+      const errBox = el('div', { class: 'w-1/2 max-w-[160px] aspect-square rounded-lg bg-rose-50 border border-rose-200 p-2 text-[10px] text-rose-700 flex flex-col justify-between' });
+      errBox.appendChild(el('div', { text: (img.error || '').slice(0, 120) }));
+      errBox.appendChild(el('button', {
+        class: 'mt-1 text-xs underline text-rose-800',
+        onclick: async () => { delete state.generatedImages[i]; render(); await generateOne(i, look); }
+      }, '↻ Riprova'));
+      pair.appendChild(errBox);
+    } else {
+      pair.appendChild(el('div', { class: 'w-1/2 max-w-[160px] aspect-square rounded-lg bg-stone-200 animate-pulse' }));
+    }
+    imgCol.appendChild(pair);
+    if (typeof img === 'string') {
+      imgCol.appendChild(el('a', {
+        href: img, download: `look-${i + 1}-${(look.title || '').replace(/\s+/g, '-').toLowerCase()}.png`,
+        class: 'text-xs underline text-stone-600 no-print'
+      }, '⬇ scarica immagine'));
+    }
+    grid.appendChild(imgCol);
+
+    const txt = el('div', { class: 'p-5 md:p-6 space-y-3' });
+    txt.appendChild(el('div', {}, [
+      el('p', { class: 'text-[10px] tracking-[0.2em] uppercase text-stone-400', text: `Proposta ${i + 1}${verdict ? ' · ' + (verdict.verdict === 'pass' ? '✓ verificata' : '△ approssimativa') : ''}` }),
+      el('h3', { class: 'display text-2xl text-stone-900', text: look.title || '—' }),
+      el('p', { class: 'text-sm italic text-stone-600 mt-1', text: look.vibe || '' })
+    ]));
+
+    const field = (label, value) => {
+      const row = el('div', {});
+      row.appendChild(el('p', { class: 'text-[10px] uppercase tracking-wider text-stone-500', text: label }));
+      row.appendChild(el('p', { class: 'text-sm text-stone-800', text: value || '—' }));
+      return row;
+    };
+    const hair = look.hair || {}, makeup = look.makeup || {};
+    const grid2 = el('div', { class: 'grid grid-cols-2 gap-3 pt-2 border-t border-stone-100' });
+    grid2.append(
+      field('Taglio', hair.taglio), field('Colore capelli', hair.colore),
+      field('Styling', hair.styling), field('Base trucco', makeup.base),
+      field('Occhi', makeup.occhi), field('Sopracciglia', makeup.sopracciglia),
+      field('Rossetto', look.lipstick), field('Orecchini', look.earrings)
+    );
+    txt.appendChild(grid2);
+
+    if (look.perche_ti_sta) {
+      txt.appendChild(el('div', { class: 'pt-2 border-t border-stone-100' }, [
+        el('p', { class: 'text-[10px] uppercase tracking-wider text-stone-500 mb-1', text: 'Perché ti sta' }),
+        el('p', { class: 'text-sm text-stone-700 italic', text: look.perche_ti_sta })
+      ]));
+    }
+
+    if (verdict) {
+      const details = el('details', { class: 'no-print pt-2 border-t border-stone-100' });
+      details.appendChild(el('summary', { class: 'text-xs text-stone-500 underline cursor-pointer', text: 'Dettagli tecnici (checklist avversariale)' }));
+      const checksDiv = el('div', { class: 'mt-2 space-y-1 text-xs text-stone-600' });
+      Object.entries(verdict.checks || {}).forEach(([k, v]) => {
+        checksDiv.appendChild(el('div', { text: `${v.pass ? '✓' : '✕'} ${k}${v.evidence ? ' — ' + v.evidence.slice(0, 80) : ''}` }));
+      });
+      if (verdict.fix_hint) checksDiv.appendChild(el('div', { class: 'text-amber-700 mt-1', text: 'fix hint: ' + verdict.fix_hint }));
+      details.appendChild(checksDiv);
+      txt.appendChild(details);
+    }
+
+    grid.appendChild(txt);
+    card.appendChild(grid);
+    container.appendChild(card);
+  });
+
+  if (state.errorLog.filter(e => e.severity === 'error').length > 0) {
+    container.appendChild(el('div', { class: 'rounded-lg bg-amber-50 border border-amber-200 p-3 text-xs text-amber-800 no-print' }, [
+      el('span', { text: 'Nota: in questa sessione ci sono stati errori. ' }),
+      el('button', { class: 'underline font-medium', onclick: downloadLog }, 'Scarica log')
+    ]));
+  }
+
+  container.appendChild(el('p', { class: 'text-xs text-stone-400 text-center pt-4 no-print', text: `v0.2 · modalità ${state.mode} · Gemini (vision + prompt gen) + ${state.keys.anthropic ? 'Claude' : 'Gemini Pro'} (adversarial) + Nano Banana` }));
+  return container;
+}
+
+/* =============================================================
+   BOOT
+   ============================================================= */
+(async () => {
+  if (state.keys.gemini) {
+    await loadRecipe();
+    if (state.recipe) state.step = 'photo';
+  }
+  render();
+})();
+</script>
+</body>
+</html>
